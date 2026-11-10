@@ -115,12 +115,17 @@ case "$1 $2 $3" in
   "get t6c --json") cat "$FAKE_STATE/get.json" ;;
   "machine ls --json") cat "$FAKE_STATE/machines.json" ;;
   "get "*"/t6c --json") cat "$FAKE_STATE/get.json" ;;
-  "exec --json --on=dev-home"|"file read --json") "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
+  "exec --json --on=dev-home") case " $* " in *" -- printenv "*) [ -f "$FAKE_STATE/source-home-fails" ] && { echo "hc cannot reach dev-home" >&2; exit 1; } ;; esac
+    "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
+  "exec --json --"|"file read --json") "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac`,
   );
   await writeFile(join(bin, "remote.mjs"), REMOTE_HC);
-  await script(join(bin, "claude-klock"), `[ "$1" = "--where" ] && printf '%s\\n' "${home}/.claude-klock"`);
+  await script(
+    join(bin, "claude-klock"),
+    `[ "$1" = "--where" ] && printf '%s\\n' "${home}/.claude-klock"; [ "$1" = "--version" ] && echo "2.1.321 (Claude Code)"; exit 0`,
+  );
   terminal = await parseTerminal(await fixture("hc-get-claude-klock.json"));
   await withStatus({ app: "claude-code", state: "done" });
   await publishTerminal();
@@ -301,17 +306,35 @@ describe("dry-run refuses a move without the Mac at exactly one end", () => {
   });
 });
 
-describe("a move without --dry-run of a session that is not on the Mac (way_back_not_ready)", () => {
-  it("refuses as way_back_not_ready and runs nothing", async () => {
+describe("a move without --dry-run of a session that is not on the Mac", () => {
+  it("reports an hc failure as hc_failed with exit 1, not as a refusal of the way back", async () => {
     await writeFile(join(state, "hc-fails"), "");
 
     const json = await cli("dev-home/t6c", "local", "--json");
     const text = await cli("dev-home/t6c", "local");
 
-    expect(json.code).toBe(3);
-    expect(JSON.parse(json.stdout)).toEqual({ refused: { reason: "way_back_not_ready", detail: expect.any(String) } });
-    expect(text.code).toBe(3);
-    expect(text.stderr).toContain("way_back_not_ready");
+    expect(json.code).toBe(1);
+    expect(JSON.parse(json.stdout)).toEqual({ error: { reason: "hc_failed", detail: expect.any(String) } });
+    expect(text.code).toBe(1);
+    expect(text.stderr).toContain("hc_failed");
+    expect(text.stderr).not.toContain("way_back_not_ready");
+  });
+
+  it("reports hc failing to read the source's home, after the checks pass, as hc_failed with exit 1 and writes nothing", async () => {
+    await registry(join(home, ".claude-klock"));
+    await writeFile(join(state, "source-home-fails"), "");
+
+    const run = await cli("dev-home/t6c", "local", "--json");
+
+    expect(JSON.parse(run.stdout)).toEqual({ error: { reason: "hc_failed", detail: expect.stringContaining("hc cannot reach dev-home") } });
+    expect(run.code).toBe(1);
+  });
+
+  it("refuses a move with the Mac at neither end with the plan's reason, as --dry-run does", async () => {
+    const move = await cli("dev-home/t6c", "base-digital", "--json");
+
+    expect(move.code).toBe(3);
+    expect(JSON.parse(move.stdout)).toEqual({ refused: { reason: "mac_not_an_end", detail: expect.any(String) } });
   });
 
   it.each(["/t6c", "local/t6c", "a/b/t6c", "dev-home/"])("refuses the malformed address %s as terminal_not_running, as --dry-run does", async (address) => {

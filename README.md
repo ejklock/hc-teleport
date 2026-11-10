@@ -1,6 +1,6 @@
 # hc-teleport
 
-Moves a coding-agent session that runs in a herdr-core (`hc`) terminal from the Mac to another `hc` machine. `--dry-run` also plans the way back, a session on an `hc` machine to the Mac; the move itself does not run that direction yet. The design and plan live in `docs/issues/0001-move-a-claude-code-session-between-the-mac-and-dev-home-from-an-hc-terminal.md`.
+Moves a coding-agent session that runs in a herdr-core (`hc`) terminal from the Mac to another `hc` machine. It also moves a session back, from an `hc` machine to the Mac. The design and plan live in `docs/issues/0001-move-a-claude-code-session-between-the-mac-and-dev-home-from-an-hc-terminal.md`.
 
 `hc-teleport <terminal> <machine>` moves the session. In order it plans, checks the destination (preflight), carries the git checkout, carries the transcript, resumes the session in a new terminal on the destination and waits until it is idle there, confirms the destination's session registry names the session, then stops the source terminal and parks the source checkout. A refusal before the first write changes nothing on either side; a destination that does not come up is rolled back and the source is never touched. `--dry-run` only plans: it reads the terminal and prints what a move would resume, and writes nothing, starts nothing and stops nothing.
 
@@ -10,7 +10,7 @@ Moves a coding-agent session that runs in a herdr-core (`hc`) terminal from the 
 hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]
 ```
 
-`--timeout` is how long the move waits for the resumed session to be idle on the destination: a whole number of seconds from 1 to 600, 120 by default. Run it on the Mac. `<terminal>` is an `hc` terminal address: `t6c` for a terminal on the Mac, `dev-home/t6c` for one on the `hc` machine `dev-home`. `<machine>` is the destination: a name from `hc machine ls`, or `local` for the Mac, which `hc machine ls` never lists. A move has the Mac at exactly one end, so `hc-teleport dev-home/t6c local --dry-run --json` plans the way back, reading the session on `dev-home` through `hc`. Without `--dry-run`, a session that is not on the Mac refuses with `way_back_not_ready` and nothing runs. It needs Node 26 (`.nvmrc`) and `hc` on the PATH.
+`--timeout` is how long the move waits for the resumed session to be idle on the destination: a whole number of seconds from 1 to 600, 120 by default. Run it on the Mac. `<terminal>` is an `hc` terminal address: `t6c` for a terminal on the Mac, `dev-home/t6c` for one on the `hc` machine `dev-home`. `<machine>` is the destination: a name from `hc machine ls`, or `local` for the Mac, which `hc machine ls` never lists. A move has the Mac at exactly one end, so `hc-teleport dev-home/t6c local` is the way back: it reads the session on `dev-home` through `hc`, carries git and the transcript to the Mac, resumes the session in a new terminal on the Mac, then stops the terminal on `dev-home` and parks its checkout there; with `--dry-run` it only plans that. It needs Node 26 (`.nvmrc`) and `hc` on the PATH.
 
 The session is found from the terminal itself. For Claude Code, the config directory comes from `<launcher> --where` (a plain `claude` uses `~/.claude`), and `<configDir>/sessions/<foreground pid>.json` names the session id. That file is internal to Claude Code and undocumented, so an unknown shape refuses.
 
@@ -69,7 +69,6 @@ A refusal prints `{"refused":{"reason":"...","detail":"..."}}` on stdout under `
 | `same_machine` | The terminal runs on the machine it would move to (`t6c local`, `dev-home/t6c dev-home`). |
 | `mac_not_an_end` | Neither end is the Mac (`dev-home/t6c vps`); a move goes between the Mac and one `hc` machine. |
 | `local_name_taken` | `hc machine ls` lists a machine named `local`, the name hc-teleport uses for the Mac; rename it with `hc machine rename`. |
-| `way_back_not_ready` | Without `--dry-run`, the terminal is on an `hc` machine rather than the Mac; only the plan runs in that direction. |
 | `not_claude` | The terminal's foreground process is not `claude`. |
 | `config_dir_unknown` | `<launcher> --where` failed or did not print an absolute path. |
 | `no_session` | The pid registry file does not exist. |

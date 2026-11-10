@@ -134,11 +134,13 @@ describe("hc-teleport moves a session from source to dest through the real hc, s
     ];
   }
 
-  async function teleport(address: string, ...extra: string[]): Promise<{ code: number; json: Record<string, any>; stderr: string }> {
-    const ran = await bed.run("source", ["node", CLI, address, "dest", "--json", ...extra], { timeoutMs: MOVE_TIMEOUT_MS });
+  async function teleportTo(address: string, machine: string, ...extra: string[]): Promise<{ code: number; json: Record<string, any>; stderr: string }> {
+    const ran = await bed.run("source", ["node", CLI, address, machine, "--json", ...extra], { timeoutMs: MOVE_TIMEOUT_MS });
     expect(ran.stdout.trim().split("\n")).toHaveLength(1);
     return { code: ran.code, json: JSON.parse(ran.stdout), stderr: ran.stderr };
   }
+
+  const teleport = (address: string, ...extra: string[]) => teleportTo(address, "dest", ...extra);
 
   it.each<Launcher>(["claude", "claude-klock"])("moves a %s session with every kind of change to dest and parks the source", async (launcher) => {
     const checkout = await twinRepositories();
@@ -174,6 +176,44 @@ describe("hc-teleport moves a session from source to dest through the real hc, s
     expect((await git("source", checkout.path, "rev-parse", "HEAD")).trim()).toBe(head);
     await exec("source", ["test", "-e", `${checkout.path}/ignored.log`]);
     await exec("source", ["test", "!", "-e", `${checkout.path}/fresh.txt`]);
+  });
+
+  it("moves a session there and back and restores the original state on the Mac", async () => {
+    const checkout = await twinRepositories();
+    await changeSource(checkout);
+    const session = await startSession("claude", checkout.subdir);
+    await put("source", `${checkout.path}/blob.bin`, "\u0000\u0003\u0004\n");
+    expect(await git("source", checkout.path, "diff", "--binary")).toContain("GIT binary patch");
+    const before = await observe("source", checkout.path);
+    const head = (await git("source", checkout.path, "rev-parse", "HEAD")).trim();
+
+    const there = await teleport(session.address);
+    expect(there.code, there.stderr).toBe(0);
+    const onDest = (there.json.moved as { destination: string }).destination;
+
+    const back = await teleportTo(onDest, "local");
+
+    expect(back.code, back.stderr).toBe(0);
+    const { destination, parked } = back.json.moved as { destination: string; parked: unknown };
+    expect(destination).toMatch(/^t\d+$/);
+    expect(parked).toEqual({ parked: true });
+
+    expect(await observe("source", checkout.path)).toEqual(before);
+    expect(await git("source", checkout.path, "diff", "--binary")).toContain("GIT binary patch");
+    expect((await git("source", checkout.path, "rev-parse", "HEAD")).trim()).toBe(head);
+
+    expect(await terminal("source", destination)).toMatchObject({ state: "live", argv: ["claude", "--resume", session.id], cwd: checkout.subdir });
+    const registries = await exec("source", ["find", `${SOURCE_HOME}/.claude/sessions`, "-name", "*.json", "-exec", "cat", "{}", ";"]);
+    expect(registries).toContain(session.id);
+    const stale = await bed.run("source", ["grep", "-rl", "--", DEST_HOME, session.transcript]);
+    expect(stale).toMatchObject({ code: 1, stdout: "" });
+    expect(await exec("source", ["cat", `${session.transcript}/${session.id}.jsonl`])).toBe(`{"cwd":"${checkout.subdir}","home":"${SOURCE_HOME}/notes"}\n`);
+
+    expect((await terminal("source", onDest)).state).not.toBe("live");
+    const parkedRefs = await git("dest", checkout.path, "for-each-ref", "--format=%(refname)", `refs/hc-teleport/${session.id}/`);
+    expect(parkedRefs).toContain(`refs/hc-teleport/${session.id}/worktree`);
+    expect(await git("dest", checkout.path, "status", "--porcelain")).toBe("");
+    expect((await git("dest", checkout.path, "rev-parse", "HEAD")).trim()).toBe(head);
   });
 
   it("refuses a dirty destination, exit 3, and changes nothing on either side", async () => {

@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { parseArgs } from "node:util";
 import { Hc, HcError } from "../platform/hc.ts";
 import { moveSession, type MoveOutcome } from "../move/index.ts";
+import { MachineError } from "../platform/machine.ts";
 import { ProcessError, processRunner } from "../platform/process.ts";
 import { planSession, type SessionPlan } from "../session/index.ts";
 
@@ -147,26 +148,7 @@ async function main(args: readonly string[]): Promise<number> {
 }
 
 async function move(request: { terminal: string; machine: string; timeoutSeconds: number }, json: boolean): Promise<number> {
-  if (request.terminal.includes("/")) return refuseRemoteSource(request, json);
   return report(await moveSession(request, { hc: new Hc(), run: processRunner(), home: homedir() }), json);
-}
-
-class RemoteSource extends Error {}
-
-/**
- * A terminal address with a `/` is malformed or names an hc machine. The plan's own address parse tells them
- * apart without asking hc: a malformed address refuses before hc is read, and a well-formed one reaches hc,
- * which here fails at once. Only the other direction can be planned, not yet run.
- */
-async function refuseRemoteSource(request: { terminal: string; machine: string }, json: boolean): Promise<number> {
-  const neverAsked = new Hc(() => Promise.reject(new RemoteSource()));
-  try {
-    const planned = await planSession(request, { hc: neverAsked, home: homedir() });
-    if (!planned.ok) return refuse(planned.refusal, json);
-  } catch (error) {
-    if (!(error instanceof RemoteSource)) throw error;
-  }
-  return refuse({ reason: "way_back_not_ready", detail: `${request.terminal} does not run on the Mac; only --dry-run plans a move to the Mac` }, json);
 }
 
 async function dryRun(terminal: string, machine: string, json: boolean): Promise<number> {
@@ -177,7 +159,7 @@ async function dryRun(terminal: string, machine: string, json: boolean): Promise
 }
 
 function failure(error: unknown, json: boolean): number {
-  if (error instanceof HcError) return fail({ reason: "hc_failed", detail: error.message }, json, EXIT.failed);
+  if (error instanceof HcError || (error instanceof MachineError && error.code === "exec_failed")) return fail({ reason: "hc_failed", detail: error.message }, json, EXIT.failed);
   // A local program such as git failing before anything was written, for a session folder that is in no work tree.
   if (error instanceof ProcessError) return fail({ reason: "command_failed", detail: error.message }, json, EXIT.failed);
   return fail({ reason: "unexpected_error", detail: error instanceof Error ? error.message : String(error) }, json, EXIT.failed);

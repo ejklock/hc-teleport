@@ -353,3 +353,101 @@ describe("only reads", () => {
     );
   });
 });
+
+describe("the way back, to the Mac", () => {
+  const MAC_HOME = "/Users/mac";
+
+  /** Routes each call by its `on`: dev-home answers for the source, an absent `on` for the Mac; any other machine is unknown to hc. */
+  function pair(mac: Box) {
+    const sourceSide = new FakeHc(box());
+    const macSide = new FakeHc(mac);
+    const calls: { argv: string[]; on: string | undefined }[] = [];
+    const hc = {
+      exec: async (argv: readonly string[], options: HcExecOptions = {}): Promise<HcExecResult> => {
+        calls.push({ argv: [...argv], on: options.on });
+        if (options.on === MACHINE) return sourceSide.exec(argv, options);
+        if (options.on === undefined) return macSide.exec(argv, options);
+        throw new HcError(`hc exec on ${options.on}: no such machine`);
+      },
+    };
+    return { hc, calls };
+  }
+
+  const macBox = (overrides: Partial<Box> = {}): Box => box({ home: MAC_HOME, dirs: [`${MAC_HOME}/.claude`], ...overrides });
+  const backPlan = (): SessionPlan => ({ ...planWith(), source: MACHINE, machine: "local" });
+  const check = (hc: { exec: FakeHc["exec"] }, source: { calls: string[][]; run: Runner } = sourceRunner(box())) =>
+    preflight({ plan: backPlan(), machine: "local" }, { hc, run: source.run, adapter: new ClaudeAdapter(new LocalMachine()) });
+
+  it("reads the source's top level on the source and checks the Mac without naming a machine", async () => {
+    const { hc, calls } = pair(macBox());
+
+    const result = await check(hc);
+
+    expect(result).toEqual({ ok: true, destination: { home: MAC_HOME, configDir: `${MAC_HOME}/.claude`, version: "2.1.321" } });
+    expect(calls[0]).toEqual({ argv: ["git", "-C", CWD, "rev-parse", "--show-toplevel"], on: MACHINE });
+    const onTheMac = calls.slice(1);
+    expect(onTheMac.slice(0, 2).map((call) => call.argv[0])).toEqual(["git", "printenv"]);
+    expect(onTheMac.length).toBeGreaterThan(2);
+    expect(onTheMac.every((call) => call.on === undefined)).toBe(true);
+  });
+
+  it("does not read this machine's own top level for a source on hc", async () => {
+    const { hc } = pair(macBox());
+    const source = sourceRunner(box());
+
+    await check(hc, source);
+
+    expect(source.calls).toEqual([]);
+  });
+
+  it("refuses naming both paths when the Mac's top level differs from the source's", async () => {
+    const { hc } = pair(macBox({ toplevel: "/work" }));
+
+    const result = await check(hc);
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "dest_repo_missing" } });
+    const detail = result.ok ? "" : result.refusal.detail;
+    expect(detail).toContain("/work/project");
+    expect(detail).toMatch(/\/work(?!\/)/);
+  });
+
+  it("refuses when the path is in no work tree on the Mac", async () => {
+    const { hc } = pair(macBox({ toplevel: undefined }));
+
+    expect(await check(hc)).toMatchObject({ ok: false, refusal: { reason: "dest_repo_missing" } });
+  });
+
+  it("refuses with the adapter's reason when the wrapper is missing on the Mac", async () => {
+    const { hc } = pair(macBox({ programs: {} }));
+
+    expect(await check(hc)).toMatchObject({ ok: false, refusal: { reason: "dest_executable_missing" } });
+  });
+
+  it("refuses with the adapter's reason when the Mac's Claude Code is older than the source's", async () => {
+    const { hc } = pair(macBox({ programs: { claude: { version: "1.0.0 (Claude Code)" } } }));
+
+    expect(await check(hc)).toMatchObject({ ok: false, refusal: { reason: "dest_agent_older" } });
+  });
+
+  it("rejects with ProcessError naming the command and git's error when git exits non-zero on the source", async () => {
+    const hc = {
+      exec: async (): Promise<HcExecResult> => ({ code: 128, stdout: "", stderr: "fatal: not a git repository\n" }),
+    };
+
+    const error = await check(hc).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ProcessError);
+    expect((error as ProcessError).message).toContain(`git -C ${CWD} rev-parse --show-toplevel`);
+    expect((error as ProcessError).message).toContain("fatal: not a git repository");
+  });
+
+  it("rejects with HcError when hc fails reading the source's top level", async () => {
+    const hc = {
+      exec: async (): Promise<HcExecResult> => {
+        throw new HcError("hc exec git on dev-home: machine unreachable");
+      },
+    };
+
+    await expect(check(hc)).rejects.toBeInstanceOf(HcError);
+  });
+});

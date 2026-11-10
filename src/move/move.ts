@@ -1,5 +1,6 @@
 import { carryGit, parkSource, undoGitCarry } from "../git-carry/index.ts";
 import { HcError, type Hc, type HcTerminal, type HcWaitOutcome } from "../platform/hc.ts";
+import { HcMachine, MachineError } from "../platform/machine.ts";
 import type { Runner } from "../platform/process.ts";
 import type { RemoteRun } from "../session/agent-adapter.ts";
 import { planSession, type SessionPlan } from "../session/index.ts";
@@ -74,7 +75,12 @@ export async function moveSession(
   const checked = await preflight({ plan, machine }, { hc: deps.hc, run: deps.run, adapter: plan.adapter });
   if (!checked.ok) return { status: "refused", refusal: checked.refusal };
 
-  const git = await carryGit({ cwd: plan.cwd, machine, id: plan.session.id }, { hc: deps.hc, run: deps.run });
+  const source = remoteSource(plan);
+  const sourceHome = source === undefined ? deps.home : await new HcMachine(source, deps.hc).home();
+  const git = await carryGit(
+    { cwd: plan.cwd, machine, ...(source === undefined ? {} : { source }), id: plan.session.id },
+    { hc: deps.hc, run: deps.run },
+  );
   if (git.status === "refused") {
     return { status: "refused", refusal: { reason: git.reason, detail: GIT_REFUSALS[git.reason] ?? git.reason } };
   }
@@ -85,7 +91,7 @@ export async function moveSession(
   }
   let destination: string;
   try {
-    destination = await comeUp(plan, checked.destination, request.timeoutSeconds, written, deps);
+    destination = await comeUp(plan, { dest: checked.destination, sourceHome }, request.timeoutSeconds, written, deps);
     await requireSourceIdle(terminal, deps.hc);
   } catch (error) {
     return rollBack(written, error, deps);
@@ -97,6 +103,11 @@ export async function moveSession(
     return { status: "source_running", destination, detail: messageOf(error) };
   }
   return { status: "moved", plan, destination, parked: await park(git, deps) };
+}
+
+/** The hc machine the session moves from, or nothing when it runs on the Mac. */
+function remoteSource(plan: SessionPlan): string | undefined {
+  return plan.source === undefined || plan.source === "local" ? undefined : plan.source;
 }
 
 const IDLE_STATES: ReadonlySet<string> = new Set(["done", "idle"]);
@@ -116,7 +127,7 @@ async function requireSourceIdle(source: string, hc: Hc): Promise<void> {
 
 async function park(git: Extract<Carried, { status: "carried" }>, deps: MoveDeps): Promise<Parked> {
   try {
-    return await parkSource(git, { run: deps.run });
+    return await parkSource(git, { run: deps.run, hc: deps.hc });
   } catch (error) {
     return { parked: false, reason: messageOf(error) };
   }
@@ -124,29 +135,34 @@ async function park(git: Extract<Carried, { status: "carried" }>, deps: MoveDeps
 
 async function comeUp(
   plan: SessionPlan,
-  dest: { home: string; configDir: string },
+  ends: { dest: { home: string; configDir: string }; sourceHome: string },
   timeoutSeconds: number,
   written: Written,
   deps: MoveDeps,
 ): Promise<string> {
   const { hc } = deps;
+  const { dest } = ends;
+  const source = remoteSource(plan);
+  // hc runs on the Mac when no machine is named, with the PATH its terminals start with; `local` is never a name it knows.
+  const place = plan.machine === "local" ? {} : { on: plan.machine };
   written.transcript = await carryTranscript(
     {
       machine: plan.machine,
+      ...(source === undefined ? {} : { sourceMachine: source }),
       transcript: plan.transcript,
       sourceConfigDir: plan.session.configDir,
-      sourceHome: deps.home,
+      sourceHome: ends.sourceHome,
       destConfigDir: dest.configDir,
       destHome: dest.home,
     },
     { hc },
   );
   const deadline = Date.now() + timeoutSeconds * 1000;
-  const address = await hc.run(plan.resume.argv, { on: plan.machine, cwd: plan.cwd, keep: true });
+  const address = await hc.run(plan.resume.argv, { ...place, cwd: plan.cwd, keep: true });
   written.address = address;
   await waitUntilStopped(hc, address, deadline);
 
-  const remote: RemoteRun = { machine: plan.machine, run: (argv) => hc.exec(argv, { on: plan.machine }) };
+  const remote: RemoteRun = { machine: plan.machine, run: (argv) => hc.exec(argv, place) };
   const confirmed = await plan.adapter.confirmResumed(
     await terminalWithForeground(hc, address, deadline),
     { sessionId: plan.session.id, configDir: dest.configDir },
@@ -227,6 +243,6 @@ function messageOf(error: unknown): string {
 function describe(cause: unknown): Reason {
   if (cause instanceof TranscriptCarryError) return { reason: cause.reason, detail: cause.message };
   if (cause instanceof DidNotComeUp) return { reason: cause.reason, detail: cause.message };
-  if (cause instanceof HcError) return { reason: "hc_failed", detail: cause.message };
+  if (cause instanceof HcError || (cause instanceof MachineError && cause.code === "exec_failed")) return { reason: "hc_failed", detail: cause.message };
   return { reason: "unexpected_error", detail: messageOf(cause) };
 }

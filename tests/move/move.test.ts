@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Hc, HcWaitOutcome } from "../../src/platform/hc.ts";
 import { HcError } from "../../src/platform/hc.ts";
+import { MachineError } from "../../src/platform/machine.ts";
 import type { Runner } from "../../src/platform/process.ts";
 import type { AgentAdapter } from "../../src/session/agent-adapter.ts";
 import type { SessionPlan } from "../../src/session/index.ts";
@@ -460,6 +461,147 @@ describe("rolls back when the source is no longer idle", () => {
       left: [expect.stringContaining("refs/hc-teleport/")],
     });
     expect(events).not.toContain(`kill ${SOURCE}`);
+  });
+});
+
+describe("the way back", () => {
+  const BACK_SOURCE = "dev-home/t7";
+  const MAC_ADDRESS = "t12";
+  const MAC_DESTINATION = { home: "/Users/mac", configDir: "/Users/mac/.claude", version: "2.1.321" };
+  const backPlan: SessionPlan = {
+    ...plan,
+    terminal: BACK_SOURCE,
+    source: "dev-home",
+    machine: "local",
+    cwd: "/work/project",
+    session: { id: SESSION_ID, configDir: "/home/box/.claude", version: "2.1.321" },
+    transcript: { file: "/home/box/.claude/projects/p/s.jsonl" },
+  };
+  const backCarried = { ...carried, machine: "local", source: "dev-home" };
+  const goBack = () => moveSession({ terminal: BACK_SOURCE, machine: "local", timeoutSeconds: 120 }, deps());
+  const lastOptions = (fn: ReturnType<typeof vi.fn>): object => (fn.mock.calls.at(-1) ?? [])[1] ?? {};
+  const rollbackOrder = [`kill ${MAC_ADDRESS}`, "undoTranscript", "undoGit"];
+
+  beforeEach(() => {
+    mocks.planSession.mockResolvedValue({ ok: true, plan: backPlan });
+    mocks.preflight.mockResolvedValue({ ok: true, destination: MAC_DESTINATION });
+    mocks.carryGit.mockImplementation(async () => {
+      events.push("carryGit");
+      return backCarried;
+    });
+    mocks.carryTranscript.mockImplementation(async () => {
+      events.push("carryTranscript");
+      return { ...transcriptResult, machine: "local" };
+    });
+    hc.exec.mockImplementation(async (argv: string[]) => (argv[0] === "printenv" ? { code: 0, stdout: "/home/box\n", stderr: "" } : { code: 0, stdout: "", stderr: "" }));
+    hc.run.mockImplementation(async () => {
+      events.push("run");
+      return MAC_ADDRESS;
+    });
+    hc.terminal.mockImplementation(async (address: string) =>
+      address === BACK_SOURCE ? { address, state: "live", status: { state: "idle" } } : { address, state: "live", foreground: { pid: 70 } },
+    );
+  });
+
+  it("carries git and the transcript from the source machine, with the source's own home read on it", async () => {
+    expect(await goBack()).toEqual({ status: "moved", plan: backPlan, destination: MAC_ADDRESS, parked: { parked: true } });
+
+    expect(mocks.carryGit).toHaveBeenCalledWith({ cwd: "/work/project", machine: "local", source: "dev-home", id: SESSION_ID }, expect.anything());
+    expect(mocks.carryTranscript).toHaveBeenCalledWith(
+      {
+        machine: "local",
+        sourceMachine: "dev-home",
+        transcript: backPlan.transcript,
+        sourceConfigDir: "/home/box/.claude",
+        sourceHome: "/home/box",
+        destConfigDir: "/Users/mac/.claude",
+        destHome: "/Users/mac",
+      },
+      expect.anything(),
+    );
+    expect(hc.exec).toHaveBeenCalledWith(["printenv", "HOME"], expect.objectContaining({ on: "dev-home" }));
+  });
+
+  it("resumes on the Mac through hc run and confirms through hc exec, neither naming a machine", async () => {
+    confirmResumed.mockImplementation(async (_terminal, _expected, remote) => {
+      await remote.run(["cat", "/x"]);
+      return { ok: true };
+    });
+
+    await goBack();
+
+    expect(hc.run).toHaveBeenCalledWith(backPlan.resume.argv, expect.objectContaining({ cwd: "/work/project", keep: true }));
+    expect(lastOptions(hc.run)).not.toHaveProperty("on");
+    expect(hc.exec).toHaveBeenLastCalledWith(["cat", "/x"], expect.anything());
+    expect(lastOptions(hc.exec)).not.toHaveProperty("on");
+    expect(confirmResumed).toHaveBeenCalledWith(
+      expect.objectContaining({ address: MAC_ADDRESS }),
+      { sessionId: SESSION_ID, configDir: "/Users/mac/.claude" },
+      expect.anything(),
+    );
+  });
+
+  it("reads the source again, stops it only after the Mac is confirmed, then parks it through hc", async () => {
+    expect((await goBack()).status).toBe("moved");
+
+    expect(events).toEqual(["carryGit", "carryTranscript", "run", "wait", `kill ${BACK_SOURCE}`, "park"]);
+    expect(hc.terminal).toHaveBeenLastCalledWith(BACK_SOURCE);
+    expect(mocks.parkSource).toHaveBeenCalledWith(backCarried, expect.objectContaining({ hc }));
+  });
+
+  it("rolls the Mac back and leaves the source running when the source is no longer idle", async () => {
+    hc.terminal.mockImplementation(async (address: string) =>
+      address === BACK_SOURCE ? { address, state: "live", status: { state: "working" } } : { address, state: "live", foreground: { pid: 70 } },
+    );
+
+    expect(await goBack()).toMatchObject({ status: "rolled_back", reason: "source_not_idle" });
+    expect(events.slice(-3)).toEqual(rollbackOrder);
+    expect(events).not.toContain(`kill ${BACK_SOURCE}`);
+    expect(mocks.undoGitCarry).toHaveBeenCalledWith(backCarried, expect.anything());
+  });
+
+  it("refuses before any write when the Mac's preflight refuses", async () => {
+    mocks.preflight.mockResolvedValue({ ok: false, refusal: { reason: "dest_agent_older", detail: "no" } });
+
+    expect(await goBack()).toMatchObject({ status: "refused", refusal: { reason: "dest_agent_older" } });
+    expect(mocks.carryGit).not.toHaveBeenCalled();
+    expect(hc.exec).not.toHaveBeenCalled();
+  });
+});
+
+describe("when hc fails on the way back", () => {
+  const source = "dev-home/t9";
+  const goBack = () => moveSession({ terminal: source, machine: "local", timeoutSeconds: 120 }, deps());
+
+  beforeEach(() => {
+    mocks.planSession.mockResolvedValue({ ok: true, plan: { ...plan, terminal: source, source: "dev-home", machine: "local" } });
+    mocks.preflight.mockResolvedValue({ ok: true, destination: { home: "/Users/mac", configDir: "/Users/mac/.claude", version: "2.1.321" } });
+    hc.terminal.mockImplementation(async (address: string) =>
+      address === source ? { address, state: "live", status: { state: "idle" } } : { address, state: "live", foreground: { pid: 70 } },
+    );
+  });
+
+  it("reading the source's home rejects as an hc failure before anything is written", async () => {
+    hc.exec.mockRejectedValue(new HcError("hc exec printenv HOME on dev-home: unreachable"));
+
+    await expect(goBack()).rejects.toMatchObject({ name: "MachineError", code: "exec_failed", message: expect.stringContaining("unreachable") });
+    expect(mocks.carryGit).not.toHaveBeenCalled();
+    expect(mocks.carryTranscript).not.toHaveBeenCalled();
+  });
+
+  it("during the transcript carry, after the git carry, rolls back as hc_failed", async () => {
+    hc.exec.mockResolvedValue({ code: 0, stdout: "/home/box\n", stderr: "" });
+    mocks.carryTranscript.mockRejectedValue(new MachineError("dev-home", "exec_failed", "find: hc exec failed"));
+
+    expect(await goBack()).toMatchObject({ status: "rolled_back", reason: "hc_failed", detail: expect.stringContaining("hc exec failed") });
+    expect(events).toEqual(["carryGit", "undoGit"]);
+  });
+
+  it("a machine error that is not an exec failure is an unexpected error", async () => {
+    hc.exec.mockResolvedValue({ code: 0, stdout: "/home/box\n", stderr: "" });
+    mocks.carryTranscript.mockRejectedValue(new MachineError("dev-home", "ENOENT", "no such file"));
+
+    expect(await goBack()).toMatchObject({ status: "rolled_back", reason: "unexpected_error" });
   });
 });
 
