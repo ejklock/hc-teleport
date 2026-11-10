@@ -97,6 +97,7 @@ function planWith(overrides: { argv?: string[]; version?: string | null; cwd?: s
     session: { id: "09e11b42-f5c1-4c38-99f1-dd1d8b00355c", configDir: "/Users/mac/.claude", ...(version === null ? {} : { version }) },
     transcript: { file: "/Users/mac/.claude/projects/x/s.jsonl" },
     resume: { argv },
+    adapter: new ClaudeAdapter("/Users/mac"),
   };
 }
 

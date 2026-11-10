@@ -347,7 +347,6 @@ describe("refuses a terminal or an invocation", () => {
     ["a missing machine", ["t6c", "--dry-run"]],
     ["an extra argument", ["t6c", "dev-home", "x", "--dry-run"]],
     ["an unknown option", ["t6c", "dev-home", "--dry-run", "--frobnicate"]],
-    ["no --dry-run", ["t6c", "dev-home"]],
   ])("a wrong invocation (%s) with exit 2", async (_title, args) => {
     const run = await cli(...args);
     expect(run.code).toBe(2);

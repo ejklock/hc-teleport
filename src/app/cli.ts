@@ -2,11 +2,17 @@
 import { homedir } from "node:os";
 import { parseArgs } from "node:util";
 import { Hc, HcError } from "../platform/hc.ts";
-import { planSession, type SessionPlan, type SessionRefusal } from "../session/index.ts";
+import { moveSession, type MoveOutcome } from "../move/index.ts";
+import { ProcessError, processRunner } from "../platform/process.ts";
+import { planSession, type SessionPlan } from "../session/index.ts";
 
-const EXIT = { ok: 0, failed: 1, usage: 2, refused: 3 } as const;
+const EXIT = { ok: 0, failed: 1, usage: 2, refused: 3, rolledBack: 4 } as const;
 
-const USAGE = "usage: hc-teleport <terminal> <machine> --dry-run [--json]";
+const USAGE = "usage: hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]";
+
+const DEFAULT_TIMEOUT_S = 120;
+const MIN_TIMEOUT_S = 1;
+const MAX_TIMEOUT_S = 600;
 
 function shellQuote(token: string): string {
   return /^[\w@%+=:,./-]+$/.test(token) ? token : `'${token.replaceAll("'", `'\\''`)}'`;
@@ -42,10 +48,68 @@ function usageError(message: string): number {
   return EXIT.usage;
 }
 
-function refuse(refusal: SessionRefusal, json: boolean): number {
+type Reason = { reason: string; detail: string };
+
+function refuse(refusal: Reason, json: boolean): number {
   if (json) process.stdout.write(`${JSON.stringify({ refused: refusal })}\n`);
   process.stderr.write(`hc-teleport: refused (${refusal.reason}): ${refusal.detail}\n`);
   return EXIT.refused;
+}
+
+function fail(error: Reason & Record<string, unknown>, json: boolean, code: number): number {
+  if (json) process.stdout.write(`${JSON.stringify({ error })}\n`);
+  process.stderr.write(`hc-teleport: ${error.reason}: ${error.detail}\n`);
+  return code;
+}
+
+function parseTimeout(text: string | undefined): number | undefined {
+  if (text === undefined) return DEFAULT_TIMEOUT_S;
+  if (!/^\d+$/.test(text)) return undefined;
+  const seconds = Number(text);
+  return seconds >= MIN_TIMEOUT_S && seconds <= MAX_TIMEOUT_S ? seconds : undefined;
+}
+
+function report(outcome: MoveOutcome, json: boolean): number {
+  switch (outcome.status) {
+    case "moved": {
+      const { plan, destination, parked } = outcome;
+      process.stdout.write(
+        json
+          ? `${JSON.stringify({ moved: { terminal: plan.terminal, machine: plan.machine, session: plan.session.id, destination, parked } })}\n`
+          : `moved ${plan.terminal} to ${destination} (session ${plan.session.id}); source terminal stopped\n`,
+      );
+      process.stderr.write(
+        parked.parked
+          ? `hc-teleport: source checkout parked under refs/hc-teleport/${plan.session.id}/\n`
+          : `hc-teleport: source checkout not parked: ${parked.reason}\n`,
+      );
+      return EXIT.ok;
+    }
+    case "refused":
+      return refuse(outcome.refusal, json);
+    case "rolled_back": {
+      const rolledBack = { reason: outcome.reason, detail: outcome.detail };
+      if (json) process.stdout.write(`${JSON.stringify({ rolledBack })}\n`);
+      process.stderr.write(`hc-teleport: rolled back (${rolledBack.reason}): ${rolledBack.detail}; the source was not touched\n`);
+      return EXIT.rolledBack;
+    }
+    case "rollback_failed":
+      return fail(
+        { reason: "rollback_failed", detail: `${outcome.cause}; left on the destination: ${outcome.left.join("; ")}`, cause: outcome.cause, left: outcome.left },
+        json,
+        EXIT.failed,
+      );
+    case "source_running":
+      return fail(
+        {
+          reason: "source_running",
+          detail: `the session runs on ${outcome.destination} but the source terminal could not be stopped and still runs: ${outcome.detail}`,
+          destination: outcome.destination,
+        },
+        json,
+        EXIT.failed,
+      );
+  }
 }
 
 async function main(args: readonly string[]): Promise<number> {
@@ -53,7 +117,7 @@ async function main(args: readonly string[]): Promise<number> {
   try {
     parsed = parseArgs({
       args: [...args],
-      options: { "dry-run": { type: "boolean" }, json: { type: "boolean" } },
+      options: { "dry-run": { type: "boolean" }, json: { type: "boolean" }, timeout: { type: "string" } },
       allowPositionals: true,
       strict: true,
     });
@@ -64,23 +128,33 @@ async function main(args: readonly string[]): Promise<number> {
   if (terminal === undefined || machine === undefined || extra.length > 0) {
     return usageError("expected exactly <terminal> and <machine>");
   }
-  if (parsed.values["dry-run"] !== true) return usageError("only --dry-run is supported");
+  const timeoutSeconds = parseTimeout(parsed.values.timeout);
+  if (timeoutSeconds === undefined) {
+    return usageError(`--timeout takes a whole number of seconds from ${MIN_TIMEOUT_S} to ${MAX_TIMEOUT_S}`);
+  }
   const json = parsed.values.json === true;
 
   try {
-    const result = await planSession(
-      { terminal, machine },
-      { hc: new Hc(), home: homedir() },
-    );
-    if (!result.ok) return refuse(result.refusal, json);
-    process.stdout.write(json ? `${JSON.stringify(jsonPlan(result.plan))}\n` : `${renderPlan(result.plan)}\n`);
-    return EXIT.ok;
+    return parsed.values["dry-run"] === true
+      ? await dryRun(terminal, machine, json)
+      : report(await moveSession({ terminal, machine, timeoutSeconds }, { hc: new Hc(), run: processRunner(), home: homedir() }), json);
   } catch (error) {
-    if (!(error instanceof HcError)) throw error;
-    if (json) process.stdout.write(`${JSON.stringify({ error: { reason: "hc_failed", detail: error.message } })}\n`);
-    process.stderr.write(`hc-teleport: hc_failed: ${error.message}\n`);
-    return EXIT.failed;
+    return failure(error, json);
   }
+}
+
+async function dryRun(terminal: string, machine: string, json: boolean): Promise<number> {
+  const result = await planSession({ terminal, machine }, { hc: new Hc(), home: homedir() });
+  if (!result.ok) return refuse(result.refusal, json);
+  process.stdout.write(json ? `${JSON.stringify(jsonPlan(result.plan))}\n` : `${renderPlan(result.plan)}\n`);
+  return EXIT.ok;
+}
+
+function failure(error: unknown, json: boolean): number {
+  if (error instanceof HcError) return fail({ reason: "hc_failed", detail: error.message }, json, EXIT.failed);
+  // A local program such as git failing before anything was written, for a session folder that is in no work tree.
+  if (error instanceof ProcessError) return fail({ reason: "command_failed", detail: error.message }, json, EXIT.failed);
+  return fail({ reason: "unexpected_error", detail: error instanceof Error ? error.message : String(error) }, json, EXIT.failed);
 }
 
 process.exitCode = await main(process.argv.slice(2));

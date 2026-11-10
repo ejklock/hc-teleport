@@ -1,4 +1,4 @@
-import type { Hc } from "../platform/hc.ts";
+import type { Hc, HcTerminal } from "../platform/hc.ts";
 import type { AdapterRefusalReason, AgentAdapter } from "./agent-adapter.ts";
 import { ClaudeAdapter } from "./claude-adapter.ts";
 
@@ -9,6 +9,8 @@ export type SessionPlan = {
   session: { id: string; configDir: string; version?: string };
   transcript: { file: string; dir?: string };
   resume: { argv: readonly string[] };
+  /** The adapter that recognized the terminal, for the checks that follow the plan. */
+  adapter: AgentAdapter;
 };
 
 export type SessionRefusal = {
@@ -29,6 +31,17 @@ function refused(reason: SessionRefusal["reason"], detail: string): PlanResult {
   return { ok: false, refusal: { reason, detail } };
 }
 
+function terminalRefusal(name: string, terminal: HcTerminal): PlanResult | undefined {
+  if (terminal.state !== "live" || terminal.exit_code !== undefined) {
+    return refused("terminal_not_running", `${name} is ${terminal.state}`);
+  }
+  const status = terminal.status?.state;
+  if (status === undefined || !IDLE_STATES.has(status)) {
+    return refused("not_idle", `${name} reports status ${status ?? "none"}, not done or idle`);
+  }
+  return undefined;
+}
+
 /**
  * Reads the terminal and the machine through `hc`, then works out what a move
  * would resume. It only reads: nothing is written, started or stopped. Throws
@@ -40,13 +53,8 @@ export async function planSession(
 ): Promise<PlanResult> {
   const adapters: readonly AgentAdapter[] = [new ClaudeAdapter(deps.home)];
   const terminal = await deps.hc.terminal(request.terminal);
-  if (terminal.state !== "live" || terminal.exit_code !== undefined) {
-    return refused("terminal_not_running", `${request.terminal} is ${terminal.state}`);
-  }
-  const status = terminal.status?.state;
-  if (status === undefined || !IDLE_STATES.has(status)) {
-    return refused("not_idle", `${request.terminal} reports status ${status ?? "none"}, not done or idle`);
-  }
+  const unfit = terminalRefusal(request.terminal, terminal);
+  if (unfit !== undefined) return unfit;
 
   const machine = (await deps.hc.machines()).find((m) => m.name === request.machine);
   if (machine === undefined) return refused("unknown_machine", `${request.machine} is not an hc machine`);
@@ -73,6 +81,7 @@ export async function planSession(
       session: { id, configDir, ...(version === undefined ? {} : { version }) },
       transcript,
       resume: { argv: resume.argv },
+      adapter,
     },
   };
 }

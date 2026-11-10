@@ -15,6 +15,11 @@ while [ "$#" -gt 0 ]; do
   fi
   shift
 done
+# A test creates this file in the user's home to make `--resume` fail before anything is registered.
+if [ -n "${session_id}" ] && [ -f "${HOME}/.fake-claude-resume-fails" ]; then
+  echo "fake claude: cannot resume ${session_id}" >&2
+  exit 1
+fi
 config_dir="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
 mkdir -p "${config_dir}/sessions"
 if [ -z "${session_id}" ]; then
