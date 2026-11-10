@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stands in for a Claude Code launcher that keeps its own config directory.
+set -eu
+config_dir="${HOME}/.claude-klock"
+if [ "${1:-}" = "--where" ]; then
+  printf '%s\n' "${config_dir}"
+  exit 0
+fi
+export CLAUDE_CONFIG_DIR="${config_dir}"
+exec claude "$@"

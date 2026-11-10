@@ -74,3 +74,9 @@ npm run build
 ```
 
 Tests build their own temporary HOME and put a fake `hc` and a fake launcher first on the PATH; they never touch the real `hc` or `~/.claude*`.
+
+## Tests
+
+`npm test` runs the unit and CLI suites against fakes. It needs no Docker and finishes in seconds.
+
+`npm run test:bed` runs the container bed. It needs a running Docker daemon with `docker compose` and `ssh-keygen`, and fails with a message naming Docker when the daemon is down. The bed builds `hc` 0.1.19 from source on the first run (several minutes), then reuses the image. It starts two throwaway containers, `source` (plays the Mac, home `/Users/mac`) and `dest` (plays dev-home, home `/home/box`), adds `dest` to `source` as an `hc` machine over SSH with a key pair generated per run under `$TMPDIR`, and removes the containers, network, volumes and key afterwards. It touches nothing else on the host. A bed that cannot start fails with the command that failed; the whole start has a 12 minute budget, shorter than the 15 minute hook timeout, so a slow start reports the step that ran out of time instead of a bare test timeout. `docker compose up --wait` is bounded by compose's own `--wait-timeout`, computed from what is left of the budget; every bed process is also killed with SIGKILL when its step time is up, since compose ignores SIGTERM while it waits. Compose sometimes exits 0 when that wait timeout runs out, so after `up` returns the bed also reads both services' health and fails the start naming `up` when either is not healthy. A failed start tears itself down and checks for leftovers even when the first teardown failed.

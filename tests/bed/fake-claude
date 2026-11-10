@@ -1,0 +1,14 @@
+#!/bin/bash
+# Stands in for Claude Code: registers a session the way the real one does,
+# then stays alive as a process named claude until it is killed.
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "2.1.321 (Claude Code)"
+  exit 0
+fi
+config_dir="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
+mkdir -p "${config_dir}/sessions"
+session_id="$(cat /proc/sys/kernel/random/uuid)"
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","version":"2.1.321"}\n' \
+  "$$" "${session_id}" "${PWD}" > "${config_dir}/sessions/$$.json"
+exec -a claude sleep infinity

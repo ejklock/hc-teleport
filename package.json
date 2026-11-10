@@ -16,6 +16,7 @@
   },
   "scripts": {
     "test": "vitest run",
+    "test:bed": "vitest run --config vitest.bed.config.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit false --outDir dist"
   },
