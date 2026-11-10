@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "LIVING_DOCS_BUNDLE=docs \"$CLAUDE_PROJECT_DIR\"/.living-docs/hooks/session-context.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
