@@ -54,8 +54,19 @@ const fileReadSchema = z.object({
 });
 const fileWriteSchema = z.object({ bytes: z.number().int() });
 
+const runSchema = z.object({ address: z.string().min(1) });
+
+const waitSchema = z.object({
+  ended: z.boolean(),
+  reason: z.string(),
+  status: z.string().nullish().transform((status) => status ?? undefined),
+  exit_code: z.number().int().nullish().transform((code) => code ?? undefined),
+  signal: z.number().int().nullish().transform((signal) => signal ?? undefined),
+});
+
 const DEFAULT_EXEC_TIMEOUT_S = 60;
 const MAX_EXEC_TIMEOUT_S = 600;
+const MAX_WAIT_TIMEOUT_S = 600;
 /** Room for hc to end the program and report, so the runner never cuts hc off first. */
 const RUNNER_MARGIN_MS = 5_000;
 
@@ -72,6 +83,28 @@ export type HcExecOptions = HcPlace & {
 
 /** A program's outcome; a non-zero `code` is a result, not a failure. */
 export type HcExecResult = { code: number; stdout: string; stderr: string };
+
+export type HcRunOptions = HcPlace & {
+  /** Have hc put a shell in place of a lost program, never re-running the command. */
+  keep?: boolean;
+  /** Unique among live terminals: 1 to 32 of a-z, 0-9, `-` and `_`. */
+  name?: string;
+};
+
+export type HcWaitOptions = {
+  /** Seconds hc waits before it checks in: a whole number from 1 to 600. */
+  timeout: number;
+};
+
+/** Why a wait ended; the terminal keeps running on `timeout`, `stopped`, `blocked` and `error`. */
+export type HcWaitOutcome =
+  | { kind: "stopped"; status: "idle" | "done" }
+  | { kind: "blocked" }
+  | { kind: "error" }
+  | { kind: "exited"; code?: number; signal?: number }
+  | { kind: "timeout" }
+  /** hc ended the wait without the terminal having stopped: a message reached the waiting terminal, or the program cleared its status. */
+  | { kind: "interrupted"; reason: "message" | "status_cleared" };
 
 export type HcTerminal = z.infer<typeof terminalSchema>;
 export type HcMachine = z.infer<typeof machinesSchema>["machines"][number];
@@ -134,6 +167,34 @@ export class Hc {
     if (reply.bytes !== sent) throw new HcError(`${label}: hc wrote ${reply.bytes} bytes of ${sent}`);
   }
 
+  /**
+   * Starts a program in a new terminal without waiting for it and resolves the terminal's address.
+   * The terminal has no parent, so it outlives the terminal this process runs in.
+   */
+  async run(argv: readonly string[], options: HcRunOptions = {}): Promise<string> {
+    const keep = options.keep === true ? ["--keep"] : [];
+    const name = options.name === undefined ? [] : [`--name=${options.name}`];
+    const args = ["run", "--json", "--bg", "--no-parent", ...placeArgs(options), ...keep, ...name, "--", ...argv];
+    const label = `hc run ${argv.join(" ")}${options.on === undefined ? "" : ` on ${options.on}`}`;
+    const reply = await this.#query(args, runSchema, label);
+    return reply.address;
+  }
+
+  /** Waits until the terminal stops working, or until the timeout passes with it still working. */
+  async wait(address: string, options: HcWaitOptions): Promise<HcWaitOutcome> {
+    assertWaitTimeout(options.timeout);
+    const args = ["wait", "--json", "--timeout", String(options.timeout), "--", address];
+    const reply = await this.#query(args, waitSchema, `hc wait ${address}`, {
+      timeoutMs: options.timeout * 1000 + RUNNER_MARGIN_MS,
+    });
+    return waitOutcome(reply, `hc wait ${address}`);
+  }
+
+  /** Ends the terminal's program and resolves the terminal as hc reports it afterwards. */
+  kill(address: string): Promise<HcTerminal> {
+    return this.#query(["kill", "--json", "--", address], terminalSchema, `hc kill ${address}`);
+  }
+
   async #query<T extends z.ZodType>(
     args: readonly string[],
     schema: T,
@@ -167,6 +228,43 @@ function assertExecTimeout(timeout: number): void {
   }
 }
 
+function assertWaitTimeout(timeout: number): void {
+  if (!Number.isInteger(timeout) || timeout < 1 || timeout > MAX_WAIT_TIMEOUT_S) {
+    throw new HcError(`hc wait timeout must be a whole number of seconds from 1 to ${MAX_WAIT_TIMEOUT_S}, got ${timeout}`);
+  }
+}
+
+const STATUS_OUTCOMES: ReadonlyMap<string, HcWaitOutcome> = new Map([
+  ["idle", { kind: "stopped", status: "idle" }],
+  ["done", { kind: "stopped", status: "done" }],
+  ["blocked", { kind: "blocked" }],
+  ["error", { kind: "error" }],
+]);
+
+function waitOutcome(reply: z.infer<typeof waitSchema>, label: string): HcWaitOutcome {
+  const outcome = placeWait(reply);
+  if (outcome === undefined) {
+    throw new HcError(`${label}: hc ended the wait with reason ${reply.reason} and status ${reply.status ?? "none"}, which this wrapper cannot place`);
+  }
+  return outcome;
+}
+
+function placeWait(reply: z.infer<typeof waitSchema>): HcWaitOutcome | undefined {
+  if (!reply.ended) {
+    if (reply.reason === "timeout") return { kind: "timeout" };
+    return reply.reason === "message" ? { kind: "interrupted", reason: "message" } : undefined;
+  }
+  if (reply.reason === "exit") {
+    return {
+      kind: "exited",
+      ...(reply.exit_code === undefined ? {} : { code: reply.exit_code }),
+      ...(reply.signal === undefined ? {} : { signal: reply.signal }),
+    };
+  }
+  if (reply.reason !== "status") return undefined;
+  return reply.status === undefined ? { kind: "interrupted", reason: "status_cleared" } : STATUS_OUTCOMES.get(reply.status);
+}
+
 function execArgs(argv: readonly string[], options: HcExecOptions): string[] {
   const env = Object.entries(options.env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
   const timeout = options.timeout === undefined ? [] : ["--timeout", String(options.timeout)];
@@ -182,7 +280,7 @@ function execResult(reply: z.infer<typeof execSchema>, label: string, timeout: n
 }
 
 function placeArgs(place: HcPlace): string[] {
-  return [...(place.on === undefined ? [] : ["--on", place.on]), ...(place.cwd === undefined ? [] : ["--cwd", place.cwd])];
+  return [...(place.on === undefined ? [] : [`--on=${place.on}`]), ...(place.cwd === undefined ? [] : [`--cwd=${place.cwd}`])];
 }
 
 function fileLabel(verb: string, path: string, place: HcPlace): string {
