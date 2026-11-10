@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Bed, BED_START_TIMEOUT_MS, REPO_MOUNT } from "./bed.ts";
 
@@ -257,6 +258,131 @@ describe("transcript carry through the real hc", () => {
     it("when the transcript is missing", async () => {
       const t = layout();
       await refused(t, "transcript_missing");
+    });
+  });
+
+  describe("from a remote source to the Mac", () => {
+    /** A fresh pair of config directories with dest as the source machine and the Mac (`local`) as the destination. */
+    function backLayout() {
+      counter += 1;
+      const sourceConfigDir = `${DEST_HOME}/back-${counter}`;
+      const destConfigDir = `${SOURCE_HOME}/back-${counter}`;
+      const project = `${sourceConfigDir}/projects/-work-app`;
+      const file = `${project}/session-1.jsonl`;
+      const input = {
+        machine: "local",
+        sourceMachine: "dest",
+        transcript: { file, dir: `${project}/session-1` },
+        sourceConfigDir,
+        sourceHome: DEST_HOME,
+        destConfigDir,
+        destHome: SOURCE_HOME,
+      };
+      const onMac = (path: string) => path.replace(sourceConfigDir, destConfigDir);
+      return { sourceConfigDir, destConfigDir, project, file, input, onMac };
+    }
+
+    async function seedOnDest(path: string, text: string): Promise<void> {
+      const dir = path.slice(0, path.lastIndexOf("/"));
+      expect((await bed.run("dest", ["mkdir", "-p", dir])).code).toBe(0);
+      expect((await bed.run("dest", ["tee", path], { stdin: text })).code).toBe(0);
+    }
+
+    async function seedOnMac(path: string, text: string): Promise<void> {
+      const dir = path.slice(0, path.lastIndexOf("/"));
+      expect((await bed.run("source", ["mkdir", "-p", dir])).code).toBe(0);
+      expect((await bed.run("source", ["tee", path], { stdin: text })).code).toBe(0);
+    }
+
+    async function macFiles(dir: string): Promise<string[]> {
+      const ran = await bed.run("source", ["find", dir, "-type", "f"]);
+      return ran.code === 0 ? ran.stdout.split("\n").filter((entry) => entry !== "").sort() : [];
+    }
+
+    const text = (home: string) => `{"cwd":"${home}/app","other":"/home/boxer/x","ü":"é"}\n`;
+
+    it("carries the transcript and its subagent folder, with the Mac home in place of the remote one", async () => {
+      const t = backLayout();
+      const agent = `${t.project}/session-1/subagents/agent-a.jsonl`;
+      await seedOnDest(t.file, text(DEST_HOME));
+      await seedOnDest(agent, text(DEST_HOME).repeat(3));
+      await seedOnDest(`${t.sourceConfigDir}/.credentials.json`, '{"token":"x"}');
+      const result = (await drive("carry", t.input)) as Carried;
+      expect([...result.written].sort()).toEqual([t.onMac(t.file), t.onMac(agent)].sort());
+      expect((await bed.run("source", ["cat", t.onMac(t.file)])).stdout).toBe(text(SOURCE_HOME));
+      expect((await bed.run("source", ["cat", t.onMac(agent)])).stdout).toBe(text(SOURCE_HOME).repeat(3));
+      expect(await macFiles(t.destConfigDir)).toEqual([t.onMac(t.file), t.onMac(agent)].sort());
+    });
+
+    /** Writes a file on dest piece by piece, each piece under what one `hc exec` takes on stdin. */
+    async function seedLargeOnDest(path: string, pieces: string[]): Promise<void> {
+      expect((await bed.run("dest", ["mkdir", "-p", path.slice(0, path.lastIndexOf("/"))])).code).toBe(0);
+      expect((await bed.run("dest", ["rm", "-f", path])).code).toBe(0);
+      for (const piece of pieces) expect((await bed.run("dest", ["tee", "-a", path], { stdin: piece, timeoutMs: 115_000 })).code).toBe(0);
+    }
+
+    it("carries a 20 MB transcript past hc's read cap with multi-byte characters on every range boundary, byte for byte", async () => {
+      const t = backLayout();
+      // Filler of 0 to 6 bytes in front of each line moves the multi-byte characters across every offset a boundary can fall on.
+      const lines: string[] = [];
+      let size = 0;
+      for (let index = 0; size < 20 * MEGABYTE; index += 1) {
+        const lineText = `{"cwd":"${DEST_HOME}/é","t":"😀ü€${"x".repeat(index % 7)}","n":${index}}\n`;
+        lines.push(lineText);
+        size += Buffer.byteLength(lineText);
+      }
+      const original = lines.join("").slice(0, -1);
+      const pieces: string[] = [];
+      for (let at = 0; at < lines.length; at += 40_000) pieces.push(lines.slice(at, at + 40_000).join(""));
+      pieces[pieces.length - 1] = (pieces.at(-1) ?? "").slice(0, -1);
+      await seedLargeOnDest(t.file, pieces);
+      await drive("carry", t.input);
+      const expected = Buffer.from(original.replaceAll(`${DEST_HOME}/`, `${SOURCE_HOME}/`));
+      const landed = await bed.run("source", ["sha256sum", t.onMac(t.file)]);
+      expect(landed.stdout.split(" ")[0]).toBe(createHash("sha256").update(expected).digest("hex"));
+      const bytes = await bed.run("source", ["stat", "-c", "%s", t.onMac(t.file)]);
+      expect(Number(bytes.stdout)).toBe(expected.length);
+    });
+
+    it("refuses a byte that is not UTF-8 deep in a large remote transcript and writes nothing", async () => {
+      const t = backLayout();
+      await seedLargeOnDest(t.file, [text(DEST_HOME).repeat(100_000)]);
+      expect((await bed.run("dest", ["sh", "-c", "printf '\\377\\n' >> \"$1\"", "sh", t.file])).code).toBe(0);
+      await expect(drive("carry", t.input)).rejects.toMatchObject({ reason: "transcript_not_text" });
+      expect(await macFiles(t.destConfigDir)).toEqual([]);
+    });
+
+    it("refuses a remote line longer than a chunk and writes nothing", async () => {
+      const t = backLayout();
+      expect((await bed.run("dest", ["mkdir", "-p", t.project])).code).toBe(0);
+      expect((await bed.run("dest", ["sh", "-c", "head -c 8388608 /dev/zero | tr '\\0' x > \"$1\"", "sh", t.file])).code).toBe(0);
+      await expect(drive("carry", t.input)).rejects.toMatchObject({ reason: "transcript_line_too_long" });
+      expect(await macFiles(t.destConfigDir)).toEqual([]);
+    });
+
+    it("refuses a symlink in the remote subagent folder and writes nothing", async () => {
+      const t = backLayout();
+      await seedOnDest(t.file, text(DEST_HOME));
+      await seedOnDest(`${t.project}/elsewhere.jsonl`, text(DEST_HOME));
+      expect((await bed.run("dest", ["mkdir", "-p", `${t.project}/session-1`])).code).toBe(0);
+      expect((await bed.run("dest", ["ln", "-s", `${t.project}/elsewhere.jsonl`, `${t.project}/session-1/link.jsonl`])).code).toBe(0);
+      await expect(drive("carry", t.input)).rejects.toMatchObject({ reason: "transcript_outside_config" });
+      expect(await macFiles(t.destConfigDir)).toEqual([]);
+    });
+
+    it("undoes the carry: created files removed, a replaced file restored", async () => {
+      const t = backLayout();
+      const agent = `${t.project}/session-1/subagents/agent-a.jsonl`;
+      await seedOnDest(t.file, text(DEST_HOME));
+      await seedOnDest(agent, text(DEST_HOME));
+      await seedOnMac(t.onMac(t.file), "older copy\n");
+      const result = (await drive("carry", t.input)) as Carried;
+      expect(result.replaced).toHaveLength(1);
+      expect((await bed.run("source", ["cat", t.onMac(t.file)])).stdout).toBe(text(SOURCE_HOME));
+
+      await drive("undo", result);
+      expect(await macFiles(t.destConfigDir)).toEqual([t.onMac(t.file)]);
+      expect((await bed.run("source", ["cat", t.onMac(t.file)])).stdout).toBe("older copy\n");
     });
   });
 });
