@@ -1,6 +1,6 @@
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { posix } from "node:path";
+import type { Hc } from "../platform/hc.ts";
+import { LocalMachine, type Machine } from "../platform/machine.ts";
 import { ProcessError, type Runner } from "../platform/process.ts";
 
 /** What stands between a checkout and a snapshot of it. */
@@ -27,14 +27,82 @@ const AUTHOR = {
   GIT_COMMITTER_EMAIL: "hc-teleport@localhost",
 } as const;
 
+/** What a carry asks of a machine: programs and a temporary folder. */
+export type GitMachine = Pick<Machine, "name" | "exec" | "makeTempDir" | "remove">;
+
+/** The machine a checkout lives on and the git command that runs there; a non-zero exit rejects with a `ProcessError`. */
+export type GitSite = {
+  machine: GitMachine;
+  git(cwd: string, args: readonly string[], env?: Readonly<Record<string, string>>): Promise<string>;
+};
+
+const SITE_TIMEOUT_S = 300;
+
+/** Git on this host runs through the runner, as the carry's transport does; git on a machine runs through that machine. */
+export function siteOf(where: Runner | GitMachine): GitSite {
+  if (typeof where === "function") {
+    return {
+      machine: new LocalMachine(),
+      git: (cwd, args, env) => where("git", ["-C", cwd, ...args], env === undefined ? undefined : { env }),
+    };
+  }
+  return {
+    machine: where,
+    git: async (cwd, args, env) => {
+      const argv = ["git", "-C", cwd, ...args];
+      const result = await where.exec(argv, { timeoutSeconds: SITE_TIMEOUT_S, ...(env === undefined ? {} : { env }) });
+      if (result.code !== 0) throw new ProcessError(argv.join(" "), result.stderr.trim() || `exit ${result.code}`);
+      return result.stdout;
+    },
+  };
+}
+
+/**
+ * The Mac for `local`, else the hc machine of that name. A program that hc cannot run rejects with hc's own `HcError`, as
+ * every caller of a carry already expects, which the `Machine` port would turn into another type.
+ */
+export function machineNamed(name: string, hc: Pick<Hc, "exec">): GitMachine {
+  if (name === "local") return new LocalMachine();
+  const exec: Machine["exec"] = (argv, options = {}) =>
+    hc.exec(argv, {
+      on: name,
+      timeout: options.timeoutSeconds ?? SITE_TIMEOUT_S,
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
+      ...(options.env === undefined ? {} : { env: options.env }),
+    });
+  const ok = (reply: { code: number; stderr: string }, what: string): void => {
+    if (reply.code !== 0) throw new ProcessError(`${what} on ${name}`, reply.stderr.trim() || `exit ${reply.code}`);
+  };
+  return {
+    name,
+    exec,
+    makeTempDir: async () => {
+      const reply = await exec(["mktemp", "-d", "-t", "hc-teleport-XXXXXX"]);
+      ok(reply, "mktemp");
+      const folder = reply.stdout.trim();
+      if (!posix.isAbsolute(folder) || folder.includes("\n")) {
+        throw new ProcessError(`mktemp on ${name}`, `answered ${JSON.stringify(reply.stdout)}, not one absolute path`);
+      }
+      return folder;
+    },
+    remove: async (path) => {
+      if (!posix.isAbsolute(path)) throw new ProcessError(`rm on ${name}`, `refused the path ${JSON.stringify(path)}, which is not absolute`);
+      ok(await exec(["rm", "-rf", "--", path]), "rm");
+    },
+  };
+}
+
 /**
  * Builds the staged and working-tree commits through a copy of the index, so the checkout's own index, refs
  * and files stay as they are; the user's git config never decides who the commits are by. `cwd` may lie anywhere
- * below the repository's top level: the snapshot is of the whole checkout, whose top level it names.
+ * below the repository's top level: the snapshot is of the whole checkout, whose top level it names. The checkout
+ * is on this host when `where` is a runner, else on that machine; the copy of the index sits in a temporary folder
+ * there, removed whatever happens.
  */
-export async function snapshotGit(cwd: string, run: Runner): Promise<SnapshotOutcome> {
-  const git = (args: readonly string[], env?: Readonly<Record<string, string>>): Promise<string> =>
-    run("git", ["-C", cwd, ...args], env === undefined ? undefined : { env });
+export async function snapshotGit(cwd: string, where: Runner | GitMachine): Promise<SnapshotOutcome> {
+  const site = siteOf(where);
+  const git = (args: readonly string[], env?: Readonly<Record<string, string>>): Promise<string> => site.git(cwd, args, env);
 
   const branch = (await git(["branch", "--show-current"])).trim();
   if (branch === "") return { ok: false, reason: "source_detached" };
@@ -42,14 +110,16 @@ export async function snapshotGit(cwd: string, run: Runner): Promise<SnapshotOut
   const head = await resolveHead(git);
   if (head === undefined) return { ok: false, reason: "source_no_commit" };
 
-  const scratch = await mkdtemp(join(tmpdir(), "hc-teleport-index-"));
+  const { machine } = site;
+  const scratch = await machine.makeTempDir();
   try {
-    const indexFile = join(scratch, "index");
+    const indexFile = posix.join(scratch, "index");
     const original = (await git(["rev-parse", "--path-format=absolute", "--git-path", "index"])).trim();
     // An absent index is an empty one, which git also reads from a path that does not exist.
-    await copyFile(original, indexFile).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
+    if ((await machine.exec(["test", "-e", original], { timeoutSeconds: SITE_TIMEOUT_S })).code === 0) {
+      const copied = await machine.exec(["cp", "--", original, indexFile], { timeoutSeconds: SITE_TIMEOUT_S });
+      if (copied.code !== 0) throw new ProcessError(`cp ${original} ${indexFile}`, copied.stderr.trim() || `exit ${copied.code}`);
+    }
     const env = { ...AUTHOR, GIT_INDEX_FILE: indexFile };
     const commitTree = async (parent: string): Promise<string> => {
       const tree = (await git(["write-tree"], env)).trim();
@@ -61,7 +131,7 @@ export async function snapshotGit(cwd: string, run: Runner): Promise<SnapshotOut
     const worktree = await commitTree(staged);
     return { ok: true, snapshot: { root, head, branch, staged, worktree } };
   } finally {
-    await rm(scratch, { recursive: true, force: true });
+    await machine.remove(scratch);
   }
 }
 

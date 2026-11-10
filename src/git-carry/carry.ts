@@ -1,14 +1,18 @@
 import { z } from "zod";
-import type { Hc, HcExecResult } from "../platform/hc.ts";
-import type { Runner } from "../platform/process.ts";
-import { snapshotGit, type GitSnapshot, type SourceRefusal } from "./snapshot.ts";
+import { HcError, type Hc } from "../platform/hc.ts";
+import type { ExecResult } from "../platform/machine.ts";
+import { ProcessError, type Runner } from "../platform/process.ts";
+import { machineNamed, siteOf, snapshotGit, type GitMachine, type GitSite, type GitSnapshot, type SourceRefusal } from "./snapshot.ts";
 
 export type GitCarryDeps = { hc: Pick<Hc, "exec" | "machines">; run: Runner };
 
 export type GitCarryRequest = {
   /** An absolute path in the checkout, the same on both machines: the top level or a folder below it. */
   cwd: string;
+  /** The destination: `local` for the Mac, else an hc machine's name. */
   machine: string;
+  /** The machine holding the checkout carried; `local` when absent. Exactly one of the two ends is `local`. */
+  source?: string;
   /** The session id; it names the temporary refs. */
   id: string;
 };
@@ -18,6 +22,8 @@ export type GitCarryRefusal = SourceRefusal | "machine_without_ssh" | "dest_repo
 /** What a carry leaves on the destination once its refs are pushed. */
 export type CarriedState = {
   machine: string;
+  /** The machine the checkout was carried from, `local` for the Mac; absent only on an outcome made before this field existed, which means `local`. */
+  source?: string;
   /** The session id the refs are named by. */
   id: string;
   /** The repository's top level, the checkout that was worked on; the same path on both machines. */
@@ -47,6 +53,7 @@ export type GitCarryOutcome =
     } & CarriedState)
   | { status: "refused"; reason: GitCarryRefusal };
 
+const LOCAL = "local";
 const PUSH_TIMEOUT_MS = 600_000;
 const DEST_TIMEOUT_S = 300;
 const CLEAN_BATCH = 100;
@@ -60,46 +67,43 @@ export const refNames = (id: string): { head: string; staged: string; worktree: 
 });
 
 /**
- * Makes the checkout at `cwd` on `machine` match the one here: commits, staged, unstaged and untracked changes, binary
- * and mode changes. Everything is checked before the first push; a refusal writes nothing on either side. Ignored files
- * stay behind. The source checkout, its index and its branch are not changed. The checkout is the whole repository
- * holding `cwd`, which the destination must hold at the same top level path. A destination step that fails after
- * the push resolves as `failed`, never throws: the refs stay and the outcome carries the destination's previous branch
- * and HEAD. This session's refs from an earlier attempt are overwritten.
+ * Makes the checkout at `cwd` on `machine` match the one on the source machine: commits, staged, unstaged and
+ * untracked changes, binary and mode changes. The Mac, named `local`, is one end and an hc machine the other; the
+ * bytes always move by a git command the Mac runs, a push when the Mac is the source and a fetch when it is the
+ * destination. A fetch asks for refs, so the source holds this session's refs only while it runs and loses them right
+ * after, whether it succeeded or not. Everything is checked before the first byte moves; a refusal writes nothing on
+ * either side. Ignored files stay behind. The source checkout, its index and its branch are not changed. The checkout
+ * is the whole repository holding `cwd`, which the destination must hold at the same top level path. A destination
+ * step that fails after the transfer resolves as `failed`, never throws: the refs stay and the outcome carries the
+ * destination's previous branch and HEAD. This session's refs from an earlier attempt are overwritten. Rejects with a
+ * `RangeError` when neither end or both ends are the Mac.
  */
 export async function carryGit(request: GitCarryRequest, deps: GitCarryDeps): Promise<GitCarryOutcome> {
-  const id = idSchema.parse(request.id);
-  const { cwd, machine } = request;
-  if (!cwd.startsWith("/")) throw new Error(`the checkout path must be absolute, got ${cwd}`);
-
-  const found = (await deps.hc.machines()).find((candidate) => candidate.name === machine);
-  if (found === undefined) throw new Error(`hc knows no machine named ${machine}`);
+  const { id, cwd, machine, source, remote } = checkedEnds(request);
+  const found = (await deps.hc.machines()).find((candidate) => candidate.name === remote);
+  if (found === undefined) throw new Error(`hc knows no machine named ${remote}`);
   if (found.sshTarget === undefined) return { status: "refused", reason: "machine_without_ssh" };
 
-  const taken = await snapshotGit(cwd, deps.run);
+  const from = source === LOCAL ? deps.run : machineNamed(source, deps.hc);
+  const taken = await snapshotGit(cwd, from);
   if (!taken.ok) return { status: "refused", reason: taken.reason };
   const { snapshot } = taken;
   const { root } = snapshot;
 
-  const dest = new Destination(deps.hc, machine, root);
-  const refusal = await destinationRefusal(dest, deps.run, cwd, snapshot);
+  const dest = new Destination(machineNamed(machine, deps.hc), root);
+  const site = siteOf(from);
+  const refusal = await destinationRefusal(dest, site, cwd, snapshot);
   if (refusal !== undefined) return { status: "refused", reason: refusal };
 
   const previous = await dest.previousState();
   const branchPreviousHead = await dest.branchHead(snapshot.branch);
   const refs = refNames(id);
-  // Forced: nothing but this carry writes under this session's id, and an earlier attempt may have left its refs.
-  const pushed = [
-    `+${snapshot.head}:${refs.head}`,
-    `+${snapshot.staged}:${refs.staged}`,
-    `+${snapshot.worktree}:${refs.worktree}`,
-  ];
-  await deps.run("git", ["-C", root, "push", "--atomic", "--quiet", "--", `${found.sshTarget}:${root}`, ...pushed], {
-    timeoutMs: PUSH_TIMEOUT_MS,
-  });
+  const transfer = { run: deps.run, site, root, address: `${found.sshTarget}:${root}`, snapshot, refs };
+  await (source === LOCAL ? push(transfer) : fetch(transfer));
 
   const state: CarriedState = {
     machine,
+    source,
     id,
     cwd: root,
     refs: Object.values(refs),
@@ -110,6 +114,85 @@ export async function carryGit(request: GitCarryRequest, deps: GitCarryDeps): Pr
   };
   const failure = await dest.restore(snapshot, refs);
   return failure === undefined ? { status: "carried", ...state } : { status: "failed", ...failure, ...state };
+}
+
+/** The request's id, path and ends, validated: exactly one end is the Mac, and `remote` names the other. */
+function checkedEnds(request: GitCarryRequest): { id: string; cwd: string; machine: string; source: string; remote: string } {
+  const id = idSchema.parse(request.id);
+  const { cwd, machine } = request;
+  const source = request.source ?? LOCAL;
+  if (!cwd.startsWith("/")) throw new Error(`the checkout path must be absolute, got ${cwd}`);
+  if ((machine === LOCAL) === (source === LOCAL)) {
+    throw new RangeError(`a carry runs between the Mac (${LOCAL}) and one hc machine, got ${source} to ${machine}`);
+  }
+  return { id, cwd, machine, source, remote: machine === LOCAL ? source : machine };
+}
+
+type Transfer = {
+  run: Runner;
+  /** The source checkout, where the snapshot commits are stored. */
+  site: GitSite;
+  root: string;
+  /** `<sshTarget>:<root>` of the remote end. */
+  address: string;
+  snapshot: GitSnapshot;
+  refs: ReturnType<typeof refNames>;
+};
+
+/** Pushes the three snapshot commits by sha to this session's refs on the remote destination; forced, because nothing but this carry writes under the id and an earlier attempt may have left its refs. */
+async function push({ run, root, address, snapshot, refs }: Transfer): Promise<void> {
+  const pushed = [
+    `+${snapshot.head}:${refs.head}`,
+    `+${snapshot.staged}:${refs.staged}`,
+    `+${snapshot.worktree}:${refs.worktree}`,
+  ];
+  await run("git", ["-C", root, "push", "--atomic", "--quiet", "--", address, ...pushed], { timeoutMs: PUSH_TIMEOUT_MS });
+}
+
+/** Tries to delete every ref even when one fails; resolves with an error naming each ref left, of the type of the first failure (hc's, git's or another), or undefined when none is. */
+async function deleteRefs(site: GitSite, root: string, refs: readonly string[]): Promise<Error | undefined> {
+  const left: string[] = [];
+  let first: unknown;
+  for (const ref of refs) {
+    try {
+      await site.git(root, ["update-ref", "-d", ref]);
+    } catch (cause) {
+      left.push(ref);
+      first ??= cause;
+    }
+  }
+  if (left.length === 0) return undefined;
+  const suffix = `; left on the source: ${left.join(", ")}`;
+  // A `ProcessError`'s message starts with its command, which its constructor puts there again.
+  if (first instanceof ProcessError) return new ProcessError(first.command, `${first.message.slice(first.command.length + 2)}${suffix}`);
+  return first instanceof HcError ? new HcError(`${first.message}${suffix}`) : new Error(`${first instanceof Error ? first.message : String(first)}${suffix}`);
+}
+
+/**
+ * Fetches the three snapshot commits into the Mac's checkout from the remote source. A fetch names refs, so the
+ * source gets them for the length of the fetch and loses them after it, whatever its outcome; a failure of the
+ * fetch comes first, and a ref that could not be removed is reported when the fetch itself went well.
+ */
+async function fetch({ run, site, root, address, snapshot, refs }: Transfer): Promise<void> {
+  const commits: [string, string][] = [
+    [refs.head, snapshot.head],
+    [refs.staged, snapshot.staged],
+    [refs.worktree, snapshot.worktree],
+  ];
+  let failure: unknown;
+  try {
+    for (const [ref, commit] of commits) await site.git(root, ["update-ref", ref, commit]);
+    await run(
+      "git",
+      ["-C", root, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--", address, ...commits.map(([ref]) => `+${ref}:${ref}`)],
+      { timeoutMs: PUSH_TIMEOUT_MS },
+    );
+  } catch (error) {
+    failure = error;
+  }
+  const leftover = await deleteRefs(site, root, commits.map(([ref]) => ref));
+  if (failure !== undefined) throw failure;
+  if (leftover !== undefined) throw leftover;
 }
 
 /**
@@ -129,7 +212,7 @@ export async function undoGitCarry(
   const namespace = `refs/hc-teleport/${id}/`;
   const outside = carried.refs.find((ref) => !ref.startsWith(namespace) || ref.includes(".."));
   if (outside !== undefined) throw new Error(`refusing to delete ${outside}: it is not under ${namespace}`);
-  const dest = new Destination(deps.hc, carried.machine, carried.cwd);
+  const dest = new Destination(machineNamed(carried.machine, deps.hc), carried.cwd);
   if (!(await dest.hasAnyRef(carried.refs))) return;
   if (await dest.movedFrom(carried)) await dest.rewind(carried);
   for (const ref of carried.refs) await dest.deleteRef(ref);
@@ -138,46 +221,44 @@ export async function undoGitCarry(
 /** Why the destination cannot take the carry, checked in the order a person would fix them; undefined when it can. */
 async function destinationRefusal(
   dest: Destination,
-  run: Runner,
+  source: GitSite,
   cwd: string,
   snapshot: GitSnapshot,
 ): Promise<GitCarryRefusal | undefined> {
   if (!(await dest.hasTopLevel(cwd))) return "dest_repo_missing";
   if (await dest.isDirty()) return "dest_dirty";
-  if (await hasDiverged(dest, run, snapshot.root, snapshot)) return "dest_diverged";
+  if (await hasDiverged(dest, source, snapshot.root, snapshot)) return "dest_diverged";
   return undefined;
 }
 
 /** The destination has a commit on the source's branch that the source does not hold. */
-async function hasDiverged(dest: Destination, run: Runner, cwd: string, snapshot: GitSnapshot): Promise<boolean> {
+async function hasDiverged(dest: Destination, source: GitSite, cwd: string, snapshot: GitSnapshot): Promise<boolean> {
   const theirs = await dest.branchHead(snapshot.branch);
   if (theirs === undefined) return false;
   try {
-    await run("git", ["-C", cwd, "cat-file", "-e", `${theirs}^{commit}`]);
-  } catch {
-    return true;
+    await source.git(cwd, ["cat-file", "-e", `${theirs}^{commit}`]);
+  } catch (error) {
+    if (error instanceof ProcessError) return true;
+    throw error;
   }
-  const ahead = await run("git", ["-C", cwd, "rev-list", "-n", "1", theirs, "--not", snapshot.head]);
+  const ahead = await source.git(cwd, ["rev-list", "-n", "1", theirs, "--not", snapshot.head]);
   return ahead.trim() !== "";
 }
 
-/** One checkout on one machine, driven with git plumbing through hc; no shell on the way. */
+/** One checkout on one machine, driven with git plumbing through the machine; no shell on the way. */
 class Destination {
-  readonly #hc: GitCarryDeps["hc"];
-  readonly #machine: string;
+  readonly #machine: GitMachine;
   readonly #cwd: string;
 
-  constructor(hc: GitCarryDeps["hc"], machine: string, cwd: string) {
-    this.#hc = hc;
+  constructor(machine: GitMachine, cwd: string) {
     this.#machine = machine;
     this.#cwd = cwd;
   }
 
   /** `folder` is inside a work tree whose top level is this checkout's path; another repository's top level is no match. */
   async hasTopLevel(folder: string): Promise<boolean> {
-    const result = await this.#hc.exec(["git", "-C", folder, "rev-parse", "--show-toplevel"], {
-      on: this.#machine,
-      timeout: DEST_TIMEOUT_S,
+    const result = await this.#machine.exec(["git", "-C", folder, "rev-parse", "--show-toplevel"], {
+      timeoutSeconds: DEST_TIMEOUT_S,
     });
     return result.code === 0 && result.stdout.trim() === this.#cwd;
   }
@@ -249,7 +330,7 @@ class Destination {
     } else if (previousHead !== undefined) {
       this.#ok(await this.#git(["update-ref", "--no-deref", "HEAD", previousHead]), "detach HEAD");
     } else {
-      throw new Error(`cannot undo the carry on ${this.#machine} at ${this.#cwd}: it recorded neither a branch nor a commit`);
+      throw new Error(`cannot undo the carry on ${this.#machine.name} at ${this.#cwd}: it recorded neither a branch nor a commit`);
     }
     if (branchPreviousHead === undefined) {
       this.#ok(await this.#git(["update-ref", "-d", `refs/heads/${branch}`]), `delete branch ${branch}`);
@@ -291,8 +372,8 @@ class Destination {
     this.#ok(await this.#git(["update-ref", "-d", ref]), `delete ${ref}`);
   }
 
-  #git(args: readonly string[], options: readonly string[] = []): Promise<HcExecResult> {
-    return this.#hc.exec(["git", "-C", this.#cwd, ...options, ...args], { on: this.#machine, timeout: DEST_TIMEOUT_S });
+  #git(args: readonly string[], options: readonly string[] = []): Promise<ExecResult> {
+    return this.#machine.exec(["git", "-C", this.#cwd, ...options, ...args], { timeoutSeconds: DEST_TIMEOUT_S });
   }
 
   async #optional(args: readonly string[]): Promise<string | undefined> {
@@ -301,9 +382,9 @@ class Destination {
     return result.code === 0 && text !== "" ? text : undefined;
   }
 
-  #ok(result: HcExecResult, label: string): HcExecResult {
+  #ok(result: ExecResult, label: string): ExecResult {
     if (result.code !== 0) {
-      throw new Error(`git ${label} failed on ${this.#machine} at ${this.#cwd} (exit ${result.code}): ${result.stderr.trim()}`);
+      throw new Error(`git ${label} failed on ${this.#machine.name} at ${this.#cwd} (exit ${result.code}): ${result.stderr.trim()}`);
     }
     return result;
   }

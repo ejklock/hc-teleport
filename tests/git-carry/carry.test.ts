@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { carryGit, undoGitCarry, type GitCarryDeps, type GitCarryOutcome } from "../../src/git-carry/carry.ts";
+import { parkSource } from "../../src/git-carry/index.ts";
+import { snapshotGit } from "../../src/git-carry/snapshot.ts";
 import { HcError } from "../../src/platform/hc.ts";
-import { processRunner, type Runner } from "../../src/platform/process.ts";
+import { ProcessError, processRunner, type Runner } from "../../src/platform/process.ts";
 
 const PREVIOUS_BRANCH = "other-branch";
 const PREVIOUS_HEAD = "0123456789abcdef0123456789abcdef01234567";
@@ -82,7 +84,369 @@ describe("carryGit when hc fails on a destination step after the push", () => {
   });
 });
 
-describe("undoGitCarry undoes from what the destination holds", () => {
+describe("carryGit from a remote source", () => {
+  const SSH = "dev.example.test";
+  let dev: string;
+  let folders: string[];
+  let atFetch: string[];
+  let calls: number;
+  let failFetch: boolean;
+  let sshTarget: string | undefined;
+
+  beforeEach(() => {
+    dev = join(realpathSync(root), "dev");
+    execFileSync("git", ["clone", "-q", repo, dev]);
+    mkdirSync(join(repo, "sub"));
+    mkdirSync(join(dev, "sub"));
+    folders = [];
+    atFetch = [];
+    calls = 0;
+    failFetch = false;
+    sshTarget = SSH;
+  });
+
+  const inDev = (args: readonly string[]): string =>
+    execFileSync("git", ["-C", dev, "-c", "user.name=t", "-c", "user.email=t@example.test", ...args], { encoding: "utf8" });
+
+  const readings = (dir: string): string[] =>
+    [
+      ["for-each-ref"],
+      ["rev-parse", "--verify", "-q", "HEAD"],
+      ["symbolic-ref", "-q", "HEAD"],
+      ["ls-files", "-s"],
+      ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+      ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"],
+    ].map((args) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" }).stdout);
+
+  /** hc with one machine, `dev`, that is a second checkout on this host; the Mac's path is read as that checkout's. */
+  const hc = {
+    machines: () => {
+      calls += 1;
+      return Promise.resolve([{ name: "dev", state: "online", ...(sshTarget === undefined ? {} : { sshTarget }) }]);
+    },
+    exec: (argv: readonly string[], options?: { env?: Readonly<Record<string, string>> }) => {
+      calls += 1;
+      const [program = "", ...rest] = argv.map((part) => part.split(repo).join(dev));
+      const result = spawnSync(program, rest, { encoding: "utf8", env: { ...process.env, ...options?.env } });
+      if (program === "mktemp") folders.push(result.stdout.trim());
+      return Promise.resolve({ code: result.status ?? 1, stdout: result.stdout.split(dev).join(repo), stderr: result.stderr });
+    },
+  };
+
+  /** The Mac's fetch reads the source's checkout directly, and notes the refs the source holds while it runs. */
+  const macRun: Runner = (file, args, options) => {
+    if (!args.includes("fetch")) return processRunner()(file, args, options);
+    atFetch.push(inDev(["for-each-ref", "refs/hc-teleport/"]));
+    if (failFetch) return Promise.reject(new ProcessError("git fetch", "the machine is unreachable"));
+    return processRunner()(file, args.map((arg) => (arg === `${SSH}:${repo}` ? dev : arg)), options);
+  };
+
+  const carry = (cwd = repo) => carryGit({ cwd, machine: "local", source: "dev", id: randomUUID() }, { hc, run: macRun });
+
+  function changeDev(): void {
+    writeFileSync(join(dev, "second.txt"), "second\n");
+    inDev(["add", "-A"]);
+    inDev(["commit", "-q", "-m", "second"]);
+    writeFileSync(join(dev, "tracked.txt"), "staged\n");
+    inDev(["add", "tracked.txt"]);
+    writeFileSync(join(dev, "tracked.txt"), "staged then edited\n");
+    writeFileSync(join(dev, "fresh.txt"), "fresh\n");
+    writeFileSync(join(dev, "blob.bin"), Buffer.from([0, 255, 1, 254, 0, 13, 10]));
+  }
+
+  const expectNothingWrittenAnywhere = async (outcome: Promise<GitCarryOutcome>, reason: string): Promise<void> => {
+    const [macBefore, devBefore] = [readings(repo), readings(dev)];
+    expect(await outcome).toEqual({ status: "refused", reason });
+    expect(readings(repo)).toEqual(macBefore);
+    expect(readings(dev)).toEqual(devBefore);
+    expect(atFetch).toEqual([]);
+    for (const folder of folders) expect(existsSync(folder)).toBe(false);
+  };
+
+  it("brings commits, staged, unstaged, untracked and binary changes to the Mac and leaves the source as it was", async () => {
+    changeDev();
+    const devBefore = readings(dev);
+
+    const outcome = await carry();
+
+    expect(outcome).toMatchObject({ status: "carried", source: "dev", machine: "local", cwd: repo, branch: "main" });
+    expect(git(["rev-parse", "HEAD"])).toBe(inDev(["rev-parse", "HEAD"]));
+    expect(git(["status", "--porcelain=v2", "-z", "--untracked-files=all"])).toBe(
+      inDev(["status", "--porcelain=v2", "-z", "--untracked-files=all"]),
+    );
+    expect(git(["ls-files", "-s"])).toBe(inDev(["ls-files", "-s"]));
+    expect(readFileSync(join(repo, "tracked.txt"), "utf8")).toBe("staged then edited\n");
+    expect(readFileSync(join(repo, "blob.bin"))).toEqual(Buffer.from([0, 255, 1, 254, 0, 13, 10]));
+    expect(readings(dev)).toEqual(devBefore);
+    expect(atFetch).toHaveLength(1);
+    expect(atFetch[0]?.trim().split("\n")).toHaveLength(3);
+    expect(inDev(["for-each-ref", "refs/hc-teleport/"])).toBe("");
+    expect(folders).toHaveLength(1);
+    expect(existsSync(folders[0] ?? "")).toBe(false);
+  });
+
+  it("carries the top level when the session folder lies below it", async () => {
+    changeDev();
+
+    const outcome = await carry(join(repo, "sub"));
+
+    expect(outcome).toMatchObject({ status: "carried", cwd: repo });
+    expect(git(["rev-parse", "HEAD"])).toBe(inDev(["rev-parse", "HEAD"]));
+  });
+
+  it("removes the source's refs and its temporary folder when the Mac's fetch fails, and changes nothing on the Mac", async () => {
+    changeDev();
+    failFetch = true;
+    const [macBefore, devBefore] = [readings(repo), readings(dev)];
+
+    await expect(carry()).rejects.toThrow("the machine is unreachable");
+
+    expect(atFetch).toHaveLength(1);
+    expect(readings(repo)).toEqual(macBefore);
+    expect(readings(dev)).toEqual(devBefore);
+    expect(inDev(["for-each-ref", "refs/hc-teleport/"])).toBe("");
+    expect(folders).toHaveLength(1);
+    expect(existsSync(folders[0] ?? "")).toBe(false);
+  });
+
+  it("undoes a carry from a remote source, putting the Mac's checkout back", async () => {
+    changeDev();
+    const macBefore = readings(repo);
+    const outcome = await carry();
+    if (outcome.status !== "carried") throw new Error(`not carried: ${outcome.status}`);
+
+    await undoGitCarry(outcome, { hc });
+
+    expect(readings(repo)).toEqual(macBefore);
+  });
+
+  describe("refuses and writes nothing on either side", () => {
+    it("when the Mac's checkout has uncommitted work", async () => {
+      changeDev();
+      writeFileSync(join(repo, "mine.txt"), "mine\n");
+      await expectNothingWrittenAnywhere(carry(), "dest_dirty");
+    });
+
+    it("when the Mac has a commit on the branch that the source lacks", async () => {
+      changeDev();
+      writeFileSync(join(repo, "mac-only.txt"), "mac\n");
+      git(["add", "-A"]);
+      git(["commit", "-q", "-m", "mac only"]);
+      await expectNothingWrittenAnywhere(carry(), "dest_diverged");
+    });
+
+    it("when the Mac holds no checkout at that path", async () => {
+      changeDev();
+      rmSync(join(repo, ".git"), { recursive: true });
+      await expectNothingWrittenAnywhere(carry(), "dest_repo_missing");
+    });
+
+    it("when the source is on a detached HEAD", async () => {
+      inDev(["checkout", "-q", "--detach"]);
+      await expectNothingWrittenAnywhere(carry(), "source_detached");
+    });
+
+    it("when the source has no commit", async () => {
+      rmSync(join(dev, ".git"), { recursive: true });
+      inDev(["init", "-q", "-b", "main"]);
+      await expectNothingWrittenAnywhere(carry(), "source_no_commit");
+    });
+
+    it("when hc reports no ssh host for the source", async () => {
+      changeDev();
+      sshTarget = undefined;
+      await expectNothingWrittenAnywhere(carry(), "machine_without_ssh");
+    });
+  });
+
+  it.each([
+    ["both ends the Mac, by default", "local", undefined],
+    ["both ends the Mac, by name", "local", "local"],
+    ["neither end the Mac", "dev", "other"],
+  ])("throws a RangeError before anything runs when %s", async (_title, machine, source) => {
+    const request = { cwd: repo, machine, id: randomUUID(), ...(source === undefined ? {} : { source }) };
+
+    await expect(carryGit(request, { hc, run: macRun })).rejects.toBeInstanceOf(RangeError);
+
+    expect(calls).toBe(0);
+  });
+});
+
+describe("carryGit, undoGitCarry and parkSource when hc fails", () => {
+  const hcDown = (): HcError => new HcError("hc exec: dev-home is offline");
+  const spawned = (argv: readonly string[], options?: { env?: Readonly<Record<string, string>> }) => {
+    const result = spawnSync(argv[0] ?? "git", argv.slice(1), { encoding: "utf8", env: { ...process.env, ...options?.env } });
+    return Promise.resolve({ code: result.status ?? 1, stdout: result.stdout, stderr: result.stderr });
+  };
+  const machines = () => Promise.resolve([{ name: "dest", state: "online", sshTarget: "dest.example.test" }]);
+
+  /** hc that runs programs here and rejects with an hc failure on a call whose argv holds every word of `on`, for the first `times` such calls. */
+  function flaky(on: readonly string[], times = Infinity) {
+    let down = 0;
+    return {
+      machines,
+      exec: (argv: readonly string[], options?: { env?: Readonly<Record<string, string>> }) => {
+        if (on.every((word) => argv.includes(word)) && down < times) {
+          down += 1;
+          return Promise.reject(hcDown());
+        }
+        return spawned(argv, options);
+      },
+    };
+  }
+
+  it.each([
+    ["the destination's top level", ["--show-toplevel"]],
+    ["the destination's status", ["status"]],
+    ["the destination's branch head", ["refs/heads/main"]],
+    ["the destination's current branch", ["symbolic-ref"]],
+  ])("carryGit rejects an HcError when hc fails on %s, before anything is pushed", async (_title, on) => {
+    const outcome = carryGit({ cwd: repo, machine: "dest", id: randomUUID() }, { run, hc: flaky(on) });
+
+    await expect(outcome).rejects.toBeInstanceOf(HcError);
+  });
+
+  describe("on the undo", () => {
+    /** A destination that moved to the carried commit, as a failed step leaves it. */
+    function movedDestination(id: string) {
+      const previousHead = git(["rev-parse", "HEAD"]).trim();
+      git(["checkout", "-q", "-b", "scratch"]);
+      writeFileSync(join(repo, "carried.txt"), "carried\n");
+      git(["add", "-A"]);
+      git(["commit", "-q", "-m", "carried"]);
+      const carriedHead = git(["rev-parse", "HEAD"]).trim();
+      git(["checkout", "-q", "main"]);
+      git(["branch", "-q", "-D", "scratch"]);
+      const refs = ["head", "staged", "worktree"].map((name) => `refs/hc-teleport/${id}/${name}`);
+      for (const ref of refs) git(["update-ref", ref, carriedHead]);
+      git(["checkout", "-q", "-B", "main", carriedHead, "--"]);
+      return {
+        status: "carried" as const,
+        machine: "dest",
+        id,
+        cwd: repo,
+        refs,
+        previousBranch: "main",
+        previousHead,
+        branch: "main",
+        branchPreviousHead: previousHead,
+        carried: { head: carriedHead, staged: carriedHead, worktree: carriedHead },
+      };
+    }
+
+    it.each([
+      ["looking for the carry's refs", ["rev-parse"]],
+      ["reading where the checkout stands", ["symbolic-ref"]],
+      ["rewinding the checkout", ["read-tree"]],
+      ["deleting a ref", ["update-ref", "-d"]],
+    ])("undoGitCarry rejects an HcError when hc fails %s", async (_title, on) => {
+      const outcome = movedDestination(randomUUID());
+
+      await expect(undoGitCarry(outcome, { hc: flaky(on) })).rejects.toBeInstanceOf(HcError);
+    });
+  });
+
+  describe("on a remote source", () => {
+    const SSH = "dev.example.test";
+    let dev: string;
+    const inDev = (args: readonly string[]): string =>
+      execFileSync("git", ["-C", dev, "-c", "user.name=t", "-c", "user.email=t@example.test", ...args], { encoding: "utf8" });
+    const refsOnDev = (): string => inDev(["for-each-ref", "refs/hc-teleport/"]);
+
+    beforeEach(() => {
+      dev = join(realpathSync(root), "dev");
+      execFileSync("git", ["clone", "-q", repo, dev]);
+      writeFileSync(join(dev, "second.txt"), "second\n");
+      inDev(["add", "-A"]);
+      inDev(["commit", "-q", "-m", "second"]);
+    });
+
+    /** hc whose machine `dev` is a second checkout here, failing on the calls `flaky` would. */
+    function devHc(on: readonly string[], times = Infinity) {
+      const inner = flaky(on, times);
+      return {
+        machines: () => Promise.resolve([{ name: "dev", state: "online", sshTarget: SSH }]),
+        exec: (argv: readonly string[], options?: { env?: Readonly<Record<string, string>> }) =>
+          inner
+            .exec(argv.map((part) => part.split(repo).join(dev)), options)
+            .then((reply) => ({ ...reply, stdout: reply.stdout.split(dev).join(repo) })),
+      };
+    }
+
+    const fetchFromDev: Runner = (file, args, options) =>
+      processRunner()(file, args.map((arg) => (arg === `${SSH}:${repo}` ? dev : arg)), options);
+
+    const carry = (hc: ReturnType<typeof devHc>, id = randomUUID()) =>
+      carryGit({ cwd: repo, machine: "local", source: "dev", id }, { hc, run: fetchFromDev });
+
+    it.each([
+      ["the snapshot's first call", ["git"]],
+      ["the snapshot's commit", ["commit-tree"]],
+      ["the temporary folder's removal", ["rm"]],
+    ])("carryGit rejects an HcError when hc fails on %s of a remote source", async (_title, on) => {
+      await expect(carry(devHc(on))).rejects.toBeInstanceOf(HcError);
+      expect(refsOnDev()).toBe("");
+    });
+
+    it("carryGit rejects an HcError when hc keeps failing on the cleanup after the fetch", async () => {
+      await expect(carry(devHc(["update-ref", "-d"]))).rejects.toBeInstanceOf(HcError);
+    });
+
+    it("carryGit deletes the other refs and names the one left when hc fails on one deletion after the fetch", async () => {
+      const id = randomUUID();
+
+      const failure = await carry(devHc(["update-ref", "-d"], 1), id).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(HcError);
+      expect((failure as HcError).message).toContain(`left on the source: refs/hc-teleport/${id}/head`);
+      expect((failure as HcError).message).not.toContain(`${id}/staged`);
+      expect(refsOnDev().trim().split("\n").map((line) => line.split(/\s+/)[2])).toEqual([`refs/hc-teleport/${id}/head`]);
+    });
+
+    it("carryGit rejects a ProcessError naming the ref left when git fails to delete a ref after the fetch", async () => {
+      const id = randomUUID();
+      const inner = devHc(["\0"]);
+      const hc = {
+        ...inner,
+        exec: (argv: readonly string[], options?: { env?: Readonly<Record<string, string>> }) =>
+          argv.includes("update-ref") && argv.includes("-d") && argv.some((part) => part.endsWith(`${id}/head`))
+            ? Promise.resolve({ code: 1, stdout: "", stderr: "fatal: cannot lock ref" })
+            : inner.exec(argv, options),
+      };
+
+      const failure = await carry(hc, id).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(ProcessError);
+      expect((failure as ProcessError).message).toContain("fatal: cannot lock ref");
+      expect((failure as ProcessError).message).toContain(`left on the source: refs/hc-teleport/${id}/head`);
+    });
+
+    it("parkSource rejects an HcError when hc fails on the source, first or later", async () => {
+      const taken = await snapshotGit(dev, run);
+      if (!taken.ok) throw new Error(taken.reason);
+      const id = randomUUID();
+      const outcome = {
+        status: "carried" as const,
+        machine: "local",
+        source: "dev",
+        cwd: dev,
+        id,
+        refs: ["head", "staged", "worktree"].map((name) => `refs/hc-teleport/${id}/${name}`),
+        branch: taken.snapshot.branch,
+        carried: { head: taken.snapshot.head, staged: taken.snapshot.staged, worktree: taken.snapshot.worktree },
+      };
+      const never: Runner = () => Promise.reject(new Error("the source is remote"));
+
+      await expect(parkSource(outcome, { run: never, hc: { exec: flaky(["update-ref"]).exec } })).rejects.toBeInstanceOf(HcError);
+      await expect(parkSource(outcome, { run: never, hc: { exec: flaky(["read-tree"]).exec } })).rejects.toBeInstanceOf(HcError);
+    });
+  });
+});
+
+describe.each([
+  ["through the stub hc machine", "dest"],
+  ["with the Mac as the destination", "local"],
+])("undoGitCarry undoes from what the destination holds %s", (_where, destination) => {
   const exec = (argv: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
     const result = spawnSync(argv[0] ?? "git", argv.slice(1), { encoding: "utf8" });
     return Promise.resolve({ code: result.status ?? 1, stdout: result.stdout, stderr: result.stderr });
@@ -119,7 +483,7 @@ describe("undoGitCarry undoes from what the destination holds", () => {
         status: "failed",
         step: "checkout",
         detail: "the machine dropped",
-        machine: "dest",
+        machine: destination,
         id,
         cwd: repo,
         refs,
@@ -172,6 +536,22 @@ describe("undoGitCarry undoes from what the destination holds", () => {
     expect(fingerprint()).toBe(before);
     expect(refsLeft(id)).toBe("");
     await undoGitCarry(created, undoDeps);
+    expect(fingerprint()).toBe(before);
+  });
+
+  it("undoes a carry onto the local machine on this host, never asking hc", async () => {
+    const id = randomUUID();
+    const { before, outcome } = pushed(id);
+    git(["checkout", "-q", "-B", "main", outcome.carried.head, "--"]);
+    git(["read-tree", "-u", "--reset", outcome.carried.worktree]);
+    const onLocal = { ...outcome, machine: "local" };
+    const noHc = { hc: { exec: () => Promise.reject(new Error("hc was asked")), machines: () => Promise.resolve([]) } };
+
+    await undoGitCarry(onLocal, noHc);
+
+    expect(fingerprint()).toBe(before);
+    expect(refsLeft(id)).toBe("");
+    await undoGitCarry(onLocal, noHc);
     expect(fingerprint()).toBe(before);
   });
 
@@ -269,7 +649,7 @@ describe("undoGitCarry undoes from what the destination holds", () => {
       git(["update-ref", refs[1] ?? "", carriedHead]);
       git(["update-ref", refs[2] ?? "", carriedHead]);
       const state = {
-        machine: "dest",
+        machine: destination,
         id,
         cwd: repo,
         refs,

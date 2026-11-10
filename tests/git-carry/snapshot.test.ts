@@ -1,11 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, realpathSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, lstatSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, lstatSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { processRunner } from "../../src/platform/process.ts";
-import { snapshotGit } from "../../src/git-carry/snapshot.ts";
+import { LocalMachine, type Machine } from "../../src/platform/machine.ts";
+import { ProcessError, processRunner } from "../../src/platform/process.ts";
+import { machineNamed, snapshotGit } from "../../src/git-carry/snapshot.ts";
 
 let root: string;
 let repo: string;
@@ -263,5 +264,111 @@ describe("snapshots a source checkout", () => {
     mkdirSync(empty);
     execFileSync("git", ["-C", empty, "init", "-q", "-b", "main"]);
     expect(await snapshotGit(empty, processRunner())).toEqual({ ok: false, reason: "source_no_commit" });
+  });
+});
+
+describe("snapshots a checkout from a remote source", () => {
+  /** A machine that is this host under another name, noting the temporary folders it hands out and failing on the program named in `failing`. */
+  function machine(failing?: string) {
+    const local = new LocalMachine();
+    const folders: string[] = [];
+    const named: Machine = {
+      name: "dev",
+      exec: (argv, options) => (argv.includes(failing ?? "\0") ? Promise.reject(new Error("the machine dropped")) : local.exec(argv, options)),
+      home: () => local.home(),
+      readFile: (path) => local.readFile(path),
+      writeFile: (path, text) => local.writeFile(path, text),
+      realpath: (path) => local.realpath(path),
+      entries: (dir) => local.entries(dir),
+      kind: (path) => local.kind(path),
+      makeTempDir: async () => {
+        const folder = await local.makeTempDir();
+        folders.push(folder);
+        return folder;
+      },
+      remove: (path) => local.remove(path),
+    };
+    return { named, folders };
+  }
+
+  it("builds the same trees as on this host, leaves the checkout alone and removes its temporary folder", async () => {
+    write("tracked.txt", "staged\n");
+    git(["add", "tracked.txt"]);
+    write("tracked.txt", "unstaged\n");
+    write("fresh.txt", "fresh\n");
+    write("blob.bin", Buffer.from([0, 255, 1, 254]));
+    const before = fingerprint();
+    const { named, folders } = machine();
+
+    const outcome = await snapshotGit(repo, named);
+
+    if (!outcome.ok) throw new Error(`refused: ${outcome.reason}`);
+    const here = await snapshot();
+    expect(treeOf(outcome.snapshot.staged)).toEqual(treeOf(here.staged));
+    expect(treeOf(outcome.snapshot.worktree)).toEqual(treeOf(here.worktree));
+    expect(outcome.snapshot).toMatchObject({ root: repo, head: here.head, branch: "main" });
+    expect(fingerprint()).toEqual(before);
+    expect(folders).toHaveLength(1);
+    expect(existsSync(folders[0] ?? "")).toBe(false);
+  });
+
+  it("removes its temporary folder when a git step fails", async () => {
+    const { named, folders } = machine("commit-tree");
+
+    await expect(snapshotGit(repo, named)).rejects.toThrow("the machine dropped");
+
+    expect(folders).toHaveLength(1);
+    expect(existsSync(folders[0] ?? "")).toBe(false);
+  });
+
+  it("refuses a detached HEAD and a branch with no commit on that machine", async () => {
+    const { named } = machine();
+    const empty = join(root, "empty");
+    mkdirSync(empty);
+    execFileSync("git", ["-C", empty, "init", "-q", "-b", "main"]);
+    expect(await snapshotGit(empty, named)).toEqual({ ok: false, reason: "source_no_commit" });
+    git(["checkout", "-q", "--detach"]);
+    expect(await snapshotGit(repo, named)).toEqual({ ok: false, reason: "source_detached" });
+  });
+});
+
+describe("machineNamed's temporary folder on an hc machine", () => {
+  /** An hc whose every program answers `stdout` with exit 0, noting each call. */
+  function answering(stdout: string) {
+    const calls: string[][] = [];
+    const hc = {
+      exec: (argv: readonly string[]) => {
+        calls.push([...argv]);
+        return Promise.resolve({ code: 0, stdout, stderr: "" });
+      },
+    };
+    return { machine: machineNamed("dev", hc), calls };
+  }
+
+  it.each([
+    ["an empty reply", " \n"],
+    ["a relative reply", "tmp/x\n"],
+    ["a reply of two lines", "/tmp/a\n/tmp/b\n"],
+  ])("makeTempDir rejects a ProcessError naming mktemp on the machine for %s", async (_title, stdout) => {
+    const { machine } = answering(stdout);
+
+    const failure = await machine.makeTempDir().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(ProcessError);
+    expect((failure as ProcessError).message).toContain("mktemp on dev");
+  });
+
+  it("makeTempDir accepts an absolute path of one line", async () => {
+    const { machine } = answering("/tmp/hc-teleport-abc123\n");
+
+    expect(await machine.makeTempDir()).toBe("/tmp/hc-teleport-abc123");
+  });
+
+  it.each([["an empty path", ""], ["a relative path", "rel"]])("remove refuses %s without calling the machine", async (_title, path) => {
+    const { machine, calls } = answering("");
+
+    await expect(machine.remove(path)).rejects.toBeInstanceOf(ProcessError);
+
+    expect(calls).toEqual([]);
   });
 });

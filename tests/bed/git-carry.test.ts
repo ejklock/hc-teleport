@@ -578,4 +578,114 @@ describe("git carry from source to dest through the real hc and ssh", () => {
       expect((await sh("dest", path, "git for-each-ref --format='%(refname)'")).trim().split("\n")).toEqual(after);
     });
   });
+
+  describe("from a remote source", () => {
+    const carryFromDest = (cwd: string, id: string): Promise<Carried | Failed | Refused> =>
+      call("carryGit", { cwd, machine: "local", source: "dest", id }) as Promise<Carried | Refused>;
+
+    async function commitOnDest(path: string, file: string, text: string): Promise<void> {
+      await sh("dest", path, `printf '${text}\\n' > ${file} && git add ${file} && git ${GIT_USER.join(" ")} commit -q -m ${file}`);
+    }
+
+    /** Dest, the remote source, with a commit the Mac lacks and every kind of change, ignored file included. */
+    async function destWithEveryChange(path: string): Promise<void> {
+      await commitOnDest(path, "second.txt", "two");
+      await sh(
+        "dest",
+        path,
+        [
+          "printf 'staged\\n' > tracked.txt",
+          "git add tracked.txt",
+          "printf 'staged then edited\\n' > tracked.txt",
+          "git rm -q gone-staged.txt",
+          "rm gone-unstaged.txt",
+          "printf 'fresh\\n' > fresh.txt",
+          "printf 'noise\\n' > ignored.log",
+          "printf '\\000\\377\\001\\376\\000\\r\\n' > blob.bin",
+          "git add blob.bin",
+          "printf '\\000\\001\\002' >> blob.bin",
+          "chmod 755 run.sh",
+        ].join(" && "),
+      );
+    }
+
+    /** The checkout as a person or git would compare it, ignored files' bytes included. */
+    function fingerprint(side: Side, path: string): Promise<string> {
+      return sh(
+        side,
+        path,
+        [
+          "git for-each-ref",
+          "git symbolic-ref -q HEAD || git rev-parse HEAD",
+          "git ls-files -s",
+          "git --no-optional-locks status --porcelain=v2 -z --untracked-files=all | od -c",
+          "git ls-files -z --others --ignored --exclude-standard | xargs -0 -r sha1sum --",
+        ].join("; echo ---; "),
+      );
+    }
+
+    const refsOnDest = (path: string): Promise<string> => sh("dest", path, "git for-each-ref --format='%(refname)' refs/hc-teleport/");
+
+    it("brings the checkout on dest to the Mac and leaves dest as it was, with no refs on it", async () => {
+      const path = await twinRepositories();
+      await destWithEveryChange(path);
+      const destBefore = await fingerprint("dest", path);
+      const id = randomUUID();
+
+      const outcome = await carryFromDest(path, id);
+
+      expect(outcome).toMatchObject({ status: "carried", source: "dest", machine: "local", cwd: path });
+      expect(await observe("source", path)).toBe(await observe("dest", path));
+      expect(await fingerprint("dest", path)).toBe(destBefore);
+      expect(await refsOnDest(path)).toBe("");
+      expect((await sh("source", path, `git for-each-ref --format='%(refname)' refs/hc-teleport/${id}/`)).trim().split("\n")).toHaveLength(3);
+    });
+
+    it("refuses a Mac checkout with uncommitted work, leaving both checkouts as they were", async () => {
+      const path = await twinRepositories();
+      await destWithEveryChange(path);
+      await sh("source", path, "printf 'mine\\n' > stray.txt");
+      const [macBefore, destBefore] = [await fingerprint("source", path), await fingerprint("dest", path)];
+
+      expect(await carryFromDest(path, randomUUID())).toEqual({ status: "refused", reason: "dest_dirty" });
+
+      expect(await fingerprint("source", path)).toBe(macBefore);
+      expect(await fingerprint("dest", path)).toBe(destBefore);
+      expect(await refsOnDest(path)).toBe("");
+    });
+
+    it("undoes the carry, putting the Mac's checkout back", async () => {
+      const path = await twinRepositories();
+      await destWithEveryChange(path);
+      const macBefore = await fingerprint("source", path);
+      const id = randomUUID();
+      const outcome = (await carryFromDest(path, id)) as Carried;
+      expect(outcome.status).toBe("carried");
+
+      await call("undoGitCarry", outcome);
+
+      expect(await fingerprint("source", path)).toBe(macBefore);
+      await call("undoGitCarry", outcome);
+      expect(await fingerprint("source", path)).toBe(macBefore);
+    });
+
+    it("parks dest's checkout with its changes under the carry's refs, clean at HEAD, ignored files kept", async () => {
+      const path = await twinRepositories();
+      await destWithEveryChange(path);
+      const id = randomUUID();
+      const outcome = (await carryFromDest(path, id)) as Carried;
+      expect(outcome.status).toBe("carried");
+
+      expect(await call("parkSource", outcome)).toEqual({ parked: true });
+
+      expect((await sh("dest", path, "git --no-optional-locks status --porcelain=v2 -z --untracked-files=all | od -c")).trim()).toBe("0000000");
+      expect((await sh("dest", path, "git rev-parse HEAD")).trim()).toBe((await sh("source", path, "git rev-parse HEAD")).trim());
+      expect((await sh("dest", path, "cat ignored.log")).trim()).toBe("noise");
+      expect((await refsOnDest(path)).trim().split("\n").sort()).toEqual([
+        `refs/hc-teleport/${id}/head`,
+        `refs/hc-teleport/${id}/staged`,
+        `refs/hc-teleport/${id}/worktree`,
+      ]);
+    });
+  });
 });

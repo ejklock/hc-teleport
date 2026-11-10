@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parkSource } from "../../src/git-carry/index.ts";
 import { snapshotGit } from "../../src/git-carry/snapshot.ts";
-import { processRunner } from "../../src/platform/process.ts";
+import { processRunner, type Runner } from "../../src/platform/process.ts";
 
 let root: string;
 let repo: string;
@@ -222,5 +222,63 @@ describe("parks the source after a carry", () => {
     const outcome = { ...(await carried()), id: "../../heads/main" };
     await expect(parkSource(outcome, { run })).rejects.toThrow(/uuid/i);
     expect(git(["for-each-ref"])).not.toMatch(/\.\.|hc-teleport/);
+  });
+});
+
+describe("parks the source of a carry from a remote source", () => {
+  /** hc whose machine is this host: it runs the program here, and the local runner is never to be used. */
+  const hc = {
+    exec: (argv: readonly string[], options?: { env?: Readonly<Record<string, string>> }) => {
+      const result = spawnSync(argv[0] ?? "git", argv.slice(1), { encoding: "utf8", env: { ...process.env, ...options?.env } });
+      return Promise.resolve({ code: result.status ?? 1, stdout: result.stdout, stderr: result.stderr });
+    },
+  };
+  const never: Runner = () => Promise.reject(new Error("the source is remote: nothing runs through the local runner"));
+
+  async function carriedFromDev() {
+    const taken = await snapshotGit(repo, run);
+    if (!taken.ok) throw new Error(taken.reason);
+    const { snapshot } = taken;
+    const id = randomUUID();
+    return {
+      status: "carried" as const,
+      machine: "local",
+      source: "dev",
+      cwd: snapshot.root,
+      id,
+      refs: ["head", "staged", "worktree"].map((name) => `refs/hc-teleport/${id}/${name}`),
+      branch: snapshot.branch,
+      carried: { head: snapshot.head, staged: snapshot.staged, worktree: snapshot.worktree },
+    };
+  }
+
+  it("parks on that machine, keeping every change under the refs and ignored files in place", async () => {
+    dirty();
+    const outcome = await carriedFromDev();
+    const before = checkout();
+
+    expect(await parkSource(outcome, { run: never, hc })).toEqual({ parked: true });
+
+    expect(git(["status", "--porcelain=v2", "-z", "--untracked-files=all"])).toBe("");
+    expect(git(["rev-parse", "HEAD"])).toBe(`${outcome.carried.head}\n`);
+    expect(readFileSync(join(repo, "ignored.log"), "utf8")).toBe("noise\n");
+    expect(refsOf(outcome.id)).toContain(`refs/hc-teleport/${outcome.id}/worktree ${outcome.carried.worktree}`);
+    git(["read-tree", "-u", "--reset", `refs/hc-teleport/${outcome.id}/worktree`]);
+    git(["read-tree", `refs/hc-teleport/${outcome.id}/staged`]);
+    expect(checkout()).toEqual(before);
+  });
+
+  it("keeps a checkout that changed after the carry and names what changed", async () => {
+    dirty();
+    const outcome = await carriedFromDev();
+    write("tracked.txt", "later\n");
+    const before = checkout();
+
+    expect(await parkSource(outcome, { run: never, hc })).toEqual({
+      parked: false,
+      reason: "the source changed after the carry: working tree",
+    });
+
+    expect(checkout()).toEqual(before);
   });
 });
