@@ -71,6 +71,7 @@ An `hc-teleport <terminal> <machine>` command moves a Claude Code session that r
 
 - **The way back runs the same flow through a `Machine` port** (owner, 2026-11-10). A port with `exec`, `readFile` and `writeFile` has a local implementation and an `hc --on` one; every slice takes a source and a destination machine, so one move flow runs both ways. Git still travels over SSH from the Mac: `git push` when the Mac is the source, `git fetch` when it is the destination. Not taken: mirrored functions for the way back beside the current ones (duplicated logic, two paths to keep in sync, slice indexes past three symbols).
 - **The Mac is named `local`** (owner, 2026-11-10). `hc-teleport dev-home/t5 local` brings a session back to the Mac; the move refuses when an `hc` machine is itself named `local`. One end of a move is always the Mac; a move between two remote machines refuses. Not taken: a `--here` flag (a second command form); no second argument meaning the Mac (a forgotten argument starts a move).
+- **An unreadable session on the source refuses `session_unreadable`** (owner, 2026-11-10). When the source machine cannot read the session's subagent folder (a permission error, a failed `find` on a remote machine), the plan refuses with exit 3 and reason `session_unreadable` before anything is written. Not taken: reusing `session_registry_unreadable` (names the registry, not the folder); treating the failure as no subagent folder (the move would write the git carry first and fail later in the transcript carry).
 
 ### Open questions
 
