@@ -16,7 +16,10 @@ const terminalSchema = z.object({
     .number()
     .nullish()
     .transform((code) => code ?? undefined),
-  status: z.object({ state: z.string() }).optional(),
+  status: z
+    .object({ state: z.string() })
+    .nullish()
+    .transform((status) => status ?? undefined),
   foreground: processSchema.optional(),
 });
 

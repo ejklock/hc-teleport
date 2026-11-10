@@ -1,0 +1,50 @@
+{
+  "address": "t6c",
+  "argv": [
+    "claude-klock",
+    "<long prompt trimmed>"
+  ],
+  "cols": 62,
+  "created_ms": 1794278956681,
+  "cwd": "/Volumes/Developer/www/klock-tecnologia/hc-teleport",
+  "die_with_parent": false,
+  "exit_code": null,
+  "finished_ms": null,
+  "foreground": {
+    "argv": [
+      "claude",
+      "<long prompt trimmed>"
+    ],
+    "cwd": "/Volumes/Developer/www/klock-tecnologia/hc-teleport",
+    "name": "2.1.321",
+    "pid": 84526
+  },
+  "identity": "ghostty",
+  "keep": true,
+  "labels": {
+    "where": "dev-fleet / Claude Code"
+  },
+  "name": "hc-teleport",
+  "notify": true,
+  "parent": "t59",
+  "pid": 84526,
+  "reason": null,
+  "records": {
+    "a6850e59cf3321ec6": {
+      "app": "claude-code",
+      "state": "working",
+      "title": "Implement hc-teleport slice S1"
+    }
+  },
+  "reported": false,
+  "rm": false,
+  "rows": 46,
+  "screen": "exact",
+  "signal": null,
+  "state": "live",
+  "status": null,
+  "status_ms": 1794282425229,
+  "template": null,
+  "title": "Claude Code",
+  "turn": 9
+}

@@ -20,7 +20,7 @@ let state: string;
 let terminal: HcTerminal;
 let registryCwd: string | undefined;
 
-async function fixture(name: string): Promise<unknown> {
+async function fixture(name: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(join(ROOT, "tests", "fixtures", name), "utf8"));
 }
 
@@ -214,6 +214,30 @@ describe("refuses a terminal or an invocation", () => {
     await withStatus(undefined);
     await publishTerminal();
     await refusal("not_idle");
+  });
+
+  it("that never reported a status, printed as null by hc, as not_idle", async () => {
+    await writeFile(join(state, "get.json"), JSON.stringify(await fixture("hc-get-unreported.json")));
+    await refusal("not_idle");
+  });
+
+  it("that never reported a status, left out by hc, as not_idle", async () => {
+    const { status: _dropped, ...unreported } = await fixture("hc-get-unreported.json");
+    await writeFile(join(state, "get.json"), JSON.stringify(unreported));
+    await refusal("not_idle");
+  });
+
+  it("that never reported a status, printed as null by hc, parses to a terminal without a status", async () => {
+    const parsed = await parseTerminal(await fixture("hc-get-unreported.json"));
+    expect(parsed.status).toBeUndefined();
+  });
+
+  it("that never reported a status but prints one of the wrong type with exit 1 and hc_failed", async () => {
+    const unreported = await fixture("hc-get-unreported.json");
+    await writeFile(join(state, "get.json"), JSON.stringify({ ...unreported, status: "done" }));
+    const run = await cli("t6c", "dev-home", "--dry-run", "--json");
+    expect(run.code).toBe(1);
+    expect(JSON.parse(run.stdout).error.reason).toBe("hc_failed");
   });
 
   it("that is not live as terminal_not_running", async () => {
