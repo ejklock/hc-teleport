@@ -9,6 +9,8 @@ export type RunOptions = {
   input?: string;
   /** Replaces the runner's timeout for this call. */
   timeoutMs?: number;
+  /** Added to the environment this process runs in; a name set here wins. */
+  env?: Readonly<Record<string, string>>;
 };
 
 export type Runner = (file: string, args: readonly string[], options?: RunOptions) => Promise<string>;
@@ -23,14 +25,14 @@ export class ProcessError extends Error {
   }
 }
 
-/** Runs a program without a shell and resolves with its stdout; any failure, a timeout included, rejects. A call may bring its own input and timeout. */
+/** Runs a program without a shell and resolves with its stdout; any failure, a timeout included, rejects. A call may bring its own input, timeout and environment. */
 export function processRunner(timeoutMs: number = PROCESS_TIMEOUT_MS): Runner {
   return (file, args, options = {}) =>
     new Promise((resolve, reject) => {
       const child = execFile(
         file,
         [...args],
-        { timeout: options.timeoutMs ?? timeoutMs, maxBuffer: PROCESS_MAX_BUFFER, encoding: "utf8" },
+        { timeout: options.timeoutMs ?? timeoutMs, maxBuffer: PROCESS_MAX_BUFFER, encoding: "utf8", env: { ...process.env, ...options.env } },
         (error, stdout, stderr) => {
           if (error === null) {
             resolve(stdout);

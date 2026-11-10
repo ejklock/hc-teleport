@@ -1,4 +1,5 @@
 import { HcError, type Hc, type HcExecResult } from "../platform/hc.ts";
+import type { Runner } from "../platform/process.ts";
 import type { AgentAdapter, DestinationRefusalReason } from "../session/agent-adapter.ts";
 import type { SessionPlan } from "../session/index.ts";
 
@@ -24,12 +25,14 @@ function homeOf(printed: HcExecResult, machine: string): string {
 
 /**
  * Checks, without writing, that the machine can resume the planned session:
- * the repository is there, then whatever the agent's adapter needs. Stops at
- * the first refusal. Throws `HcError` when `hc` itself fails.
+ * the repository is there (the same top level, at the same path, as the one
+ * holding the session's cwd here), then whatever the agent's adapter needs.
+ * Stops at the first refusal. Throws `HcError` when `hc` itself fails, and
+ * the runner's error when the cwd is in no work tree on this machine.
  */
 export async function preflight(
   request: { plan: SessionPlan; machine: string },
-  deps: { hc: Pick<Hc, "exec">; adapter: AgentAdapter },
+  deps: { hc: Pick<Hc, "exec">; run: Runner; adapter: AgentAdapter },
 ): Promise<PreflightResult> {
   const { plan, machine } = request;
   const run = async (argv: readonly string[]): Promise<HcExecResult> => {
@@ -44,6 +47,8 @@ export async function preflight(
     }
   };
 
+  const sourceTop = (await deps.run("git", ["-C", plan.cwd, "rev-parse", "--show-toplevel"])).trim();
+
   // -C rather than --cwd: a path that does not exist is then a git failure, not an hc one.
   const top = await run(["git", "-C", plan.cwd, "rev-parse", "--show-toplevel"]);
   if (top.code !== 0) {
@@ -51,8 +56,8 @@ export async function preflight(
     return refused("dest_repo_missing", `${plan.cwd} is not a git work tree on ${machine}${why === "" ? "" : `: ${why}`}`);
   }
   const toplevel = top.stdout.trim();
-  if (toplevel !== plan.cwd) {
-    return refused("dest_repo_missing", `${plan.cwd} on ${machine} is inside the work tree ${toplevel}, not its top level`);
+  if (toplevel !== sourceTop) {
+    return refused("dest_repo_missing", `${plan.cwd} on ${machine} is inside the work tree ${toplevel}, not ${sourceTop}, the one it is in here`);
   }
 
   const home = homeOf(await run(["printenv", "HOME"]), machine);

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { ProcessError, type Runner } from "../../src/platform/process.ts";
 import { HcError, type HcExecOptions, type HcExecResult } from "../../src/platform/hc.ts";
 import { preflight } from "../../src/preflight/index.ts";
 import { ClaudeAdapter } from "../../src/session/claude-adapter.ts";
@@ -7,10 +8,15 @@ import type { SessionPlan } from "../../src/session/index.ts";
 const MACHINE = "dev-home";
 const HOME = "/home/box";
 const CWD = "/work/project";
+const SUBDIRECTORY = `${CWD}/packages/api`;
 
 type Box = {
-  /** What `git rev-parse --show-toplevel` prints at CWD; absent when it is no work tree. */
+  /** What `git rev-parse --show-toplevel` prints at the plan's cwd on the destination; absent when it is no work tree. */
   toplevel?: string | undefined;
+  /** The plan's cwd on the destination; the destination answers git for no other path. */
+  cwd: string;
+  /** What `git rev-parse --show-toplevel` prints at the plan's cwd on the source. */
+  sourceToplevel: string;
   home?: string | undefined;
   /** Programs that start, with what they print. */
   programs: Record<string, { version?: string; where?: string | { fails: true } }>;
@@ -20,6 +26,8 @@ type Box = {
 function box(overrides: Partial<Box> = {}): Box {
   return {
     toplevel: CWD,
+    cwd: CWD,
+    sourceToplevel: CWD,
     home: HOME,
     programs: { claude: { version: "2.1.321 (Claude Code)" } },
     dirs: [`${HOME}/.claude`],
@@ -47,7 +55,7 @@ class FakeHc {
     this.ons.push(options.on);
     const [program = "", ...rest] = argv;
     if (program === "git") {
-      return rest[0] === "-C" && rest[1] === CWD && this.state.toplevel !== undefined ? ok(`${this.state.toplevel}\n`) : fail("not a git repository");
+      return rest[0] === "-C" && rest[1] === this.state.cwd && this.state.toplevel !== undefined ? ok(`${this.state.toplevel}\n`) : fail("not a git repository");
     }
     if (program === "printenv") return this.state.home === undefined ? fail() : ok(`${this.state.home}\n`);
     if (program === "test") return rest[0] === "-d" && this.state.dirs.includes(rest[1] ?? "") ? ok("") : fail();
@@ -66,12 +74,26 @@ class FakeHc {
   };
 }
 
-function planWith(overrides: { argv?: string[]; version?: string | null } = {}): SessionPlan {
-  const { argv = ["claude"], version = "2.1.321" } = overrides;
+/** The source machine, answering the one read-only git question the preflight asks it and recording every call. */
+function sourceRunner(state: Box): { calls: string[][]; run: Runner } {
+  const calls: string[][] = [];
+  const run: Runner = async (file, args) => {
+    calls.push([file, ...args]);
+    const [flag, path, ...rest] = args;
+    if (file === "git" && flag === "-C" && path === state.cwd && rest.join(" ") === "rev-parse --show-toplevel") {
+      return `${state.sourceToplevel}\n`;
+    }
+    throw new ProcessError([file, ...args].join(" "), "not a git repository");
+  };
+  return { calls, run };
+}
+
+function planWith(overrides: { argv?: string[]; version?: string | null; cwd?: string } = {}): SessionPlan {
+  const { argv = ["claude"], version = "2.1.321", cwd = CWD } = overrides;
   return {
     terminal: "t1",
     machine: MACHINE,
-    cwd: CWD,
+    cwd,
     session: { id: "09e11b42-f5c1-4c38-99f1-dd1d8b00355c", configDir: "/Users/mac/.claude", ...(version === null ? {} : { version }) },
     transcript: { file: "/Users/mac/.claude/projects/x/s.jsonl" },
     resume: { argv },
@@ -80,8 +102,9 @@ function planWith(overrides: { argv?: string[]; version?: string | null } = {}):
 
 function run(state: Box, plan: SessionPlan) {
   const hc = new FakeHc(state);
-  const result = preflight({ plan, machine: MACHINE }, { hc, adapter: new ClaudeAdapter("/Users/mac") });
-  return { hc, result };
+  const source = sourceRunner(state);
+  const result = preflight({ plan, machine: MACHINE }, { hc, run: source.run, adapter: new ClaudeAdapter("/Users/mac") });
+  return { hc, source, result };
 }
 
 describe("accepts a destination", () => {
@@ -115,6 +138,17 @@ describe("accepts a destination", () => {
     });
   });
 
+  it("running in a subdirectory when the destination holds the same top level at the same path", async () => {
+    const { hc, source, result } = run(box({ cwd: SUBDIRECTORY }), planWith({ cwd: SUBDIRECTORY }));
+
+    expect(await result).toEqual({
+      ok: true,
+      destination: { home: HOME, configDir: `${HOME}/.claude`, version: "2.1.321" },
+    });
+    expect(source.calls).toEqual([["git", "-C", SUBDIRECTORY, "rev-parse", "--show-toplevel"]]);
+    expect(hc.writes).toEqual([]);
+  });
+
   it("asks the machine it was given", async () => {
     const { hc, result } = run(box(), planWith());
     await result;
@@ -139,6 +173,17 @@ describe("refuses a destination", () => {
     expect(JSON.stringify(refusal)).toContain(CWD);
   });
 
+  it.each([
+    ["the destination's top level for the cwd is another repository", box({ cwd: SUBDIRECTORY, toplevel: SUBDIRECTORY })],
+    ["only the subdirectory exists there", box({ cwd: SUBDIRECTORY, toplevel: undefined })],
+    ["the destination's top level is a parent of the source's", box({ cwd: SUBDIRECTORY, toplevel: "/work", sourceToplevel: CWD })],
+  ])("with dest_repo_missing for a subdirectory cwd when %s", async (_title, state) => {
+    const { result } = run(state, planWith({ cwd: SUBDIRECTORY }));
+    const refusal = await result;
+    expect(refusal).toEqual({ ok: false, refusal: { reason: "dest_repo_missing", detail: expect.stringContaining(MACHINE) } });
+    expect(JSON.stringify(refusal)).toContain(SUBDIRECTORY);
+  });
+
   it("with dest_repo_missing naming git's own error when git exits non-zero", async () => {
     const { result } = run(box({ toplevel: undefined }), planWith());
     expect(await result).toMatchObject({ ok: false, refusal: { reason: "dest_repo_missing", detail: expect.stringContaining("not a git repository") } });
@@ -150,7 +195,7 @@ describe("refuses a destination", () => {
         throw new HcError(`hc exec ${argv.join(" ")}: {"error":{"kind":"spawn_failed","message":"cannot start git: No such file or directory"}}`);
       },
     };
-    const result = await preflight({ plan: planWith(), machine: MACHINE }, { hc, adapter: new ClaudeAdapter("/Users/mac") });
+    const result = await preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter("/Users/mac") });
     expect(result).toMatchObject({
       ok: false,
       refusal: { reason: "dest_repo_missing", detail: expect.stringContaining("cannot start git") },
@@ -249,7 +294,7 @@ describe("refuses a destination", () => {
 
 describe("only reads", () => {
   const READ_ONLY: ((argv: readonly string[]) => boolean)[] = [
-    (argv) => argv.join(" ") === `git -C ${CWD} rev-parse --show-toplevel`,
+    (argv) => argv.join(" ") === `git -C ${CWD} rev-parse --show-toplevel` || argv.join(" ") === `git -C ${SUBDIRECTORY} rev-parse --show-toplevel`,
     (argv) => argv.join(" ") === "printenv HOME",
     (argv) => argv.length === 3 && argv[0] === "test" && argv[1] === "-d",
     (argv) => argv.length === 2 && (argv[1] === "--version" || argv[1] === "--where"),
@@ -262,6 +307,8 @@ describe("only reads", () => {
     });
     const cases: [Box, SessionPlan][] = [
       [box(), planWith()],
+      [box({ cwd: SUBDIRECTORY }), planWith({ cwd: SUBDIRECTORY })],
+      [box({ cwd: SUBDIRECTORY, toplevel: SUBDIRECTORY }), planWith({ cwd: SUBDIRECTORY })],
       [launcherBox, planWith({ argv: ["claude-klock", "--resume", "x"] })],
       [box({ toplevel: undefined }), planWith()],
       [box({ programs: {} }), planWith()],
@@ -289,7 +336,7 @@ describe("only reads", () => {
         return ok(argv[0] === "git" ? `${CWD}\n` : `${HOME}\n`);
       },
     };
-    const result = await preflight({ plan: planWith(), machine: MACHINE }, { hc, adapter: new ClaudeAdapter("/Users/mac") });
+    const result = await preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter("/Users/mac") });
     expect(result).toMatchObject({ ok: false, refusal: { reason: "dest_executable_missing" } });
   });
 
@@ -299,7 +346,7 @@ describe("only reads", () => {
         throw new HcError("hc exec git on dev-home: machine unreachable");
       },
     };
-    await expect(preflight({ plan: planWith(), machine: MACHINE }, { hc, adapter: new ClaudeAdapter("/Users/mac") })).rejects.toThrow(
+    await expect(preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter("/Users/mac") })).rejects.toThrow(
       /unreachable/,
     );
   });

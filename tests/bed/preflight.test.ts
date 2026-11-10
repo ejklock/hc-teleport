@@ -4,17 +4,19 @@ import { BED_PROJECT_ROOT, Bed, BED_START_TIMEOUT_MS, REPO_MOUNT } from "./bed.t
 const DEST_HOME = "/home/box";
 const REPO = `${BED_PROJECT_ROOT}/preflight-repo`;
 const MISSING_REPO = `${BED_PROJECT_ROOT}/no-such-repo`;
+const SUBDIRECTORY = `${REPO}/packages/api`;
 const PROFILE = `${DEST_HOME}/.claude-klock`;
 
 /** Runs the preflight on source, through the real hc against dest, and prints its outcome as JSON. */
 const DRIVER = `
 import { readFileSync } from "node:fs";
 import { Hc } from "${REPO_MOUNT}/src/platform/hc.ts";
+import { processRunner } from "${REPO_MOUNT}/src/platform/process.ts";
 import { preflight } from "${REPO_MOUNT}/src/preflight/index.ts";
 import { ClaudeAdapter } from "${REPO_MOUNT}/src/session/claude-adapter.ts";
 const plan = JSON.parse(readFileSync(0, "utf8"));
 try {
-  const result = await preflight({ plan, machine: "dest" }, { hc: new Hc(), adapter: new ClaudeAdapter("/Users/mac") });
+  const result = await preflight({ plan, machine: "dest" }, { hc: new Hc(), run: processRunner(), adapter: new ClaudeAdapter("/Users/mac") });
   process.stdout.write(JSON.stringify(result));
 } catch (error) {
   process.stdout.write(JSON.stringify({ failed: String(error?.message ?? error) }));
@@ -38,6 +40,9 @@ describe("preflight through the real hc against dest", () => {
   beforeAll(async () => {
     bed = await Bed.start();
     await ok(["git", "init", "--quiet", REPO]);
+    // The source holds the repositories the plans name; MISSING_REPO is on source only.
+    await ok(["git", "init", "--quiet", REPO], "source");
+    await ok(["git", "init", "--quiet", MISSING_REPO], "source");
     await ok(["mkdir", "-p", PROFILE]);
   }, BED_START_TIMEOUT_MS);
 
@@ -45,8 +50,8 @@ describe("preflight through the real hc against dest", () => {
     await bed?.stop();
   });
 
-  async function ok(argv: string[]): Promise<void> {
-    const ran = await bed.run("dest", argv);
+  async function ok(argv: string[], side: "source" | "dest" = "dest"): Promise<void> {
+    const ran = await bed.run(side, argv);
     expect(ran, argv.join(" ")).toMatchObject({ code: 0 });
   }
 
@@ -74,6 +79,25 @@ describe("preflight through the real hc against dest", () => {
     expect(await preflightLeavingDestUntouched(planFor({}))).toEqual({
       ok: true,
       destination: { home: DEST_HOME, configDir: PROFILE, version: "2.1.321" },
+    });
+  });
+
+  it("accepts a subdirectory of the repository when dest holds the same top level, leaving dest unchanged", async () => {
+    await ok(["mkdir", "-p", SUBDIRECTORY]);
+    await ok(["mkdir", "-p", SUBDIRECTORY], "source");
+    expect(await preflightLeavingDestUntouched(planFor({ cwd: SUBDIRECTORY }))).toEqual({
+      ok: true,
+      destination: { home: DEST_HOME, configDir: PROFILE, version: "2.1.321" },
+    });
+  });
+
+  it("refuses with dest_repo_missing for a subdirectory whose repository is absent on dest", async () => {
+    const nested = `${MISSING_REPO}/packages/api`;
+    await ok(["mkdir", "-p", nested], "source");
+    await ok(["mkdir", "-p", nested]);
+    expect(await preflightLeavingDestUntouched(planFor({ cwd: nested }))).toMatchObject({
+      ok: false,
+      refusal: { reason: "dest_repo_missing", detail: expect.stringContaining(nested) },
     });
   });
 
