@@ -1,0 +1,8 @@
+{
+  "quality": {
+    "mode": "blocking",
+    "thresholds": {
+      "min_blocking_severity": "error"
+    }
+  }
+}

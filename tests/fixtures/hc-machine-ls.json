@@ -1,0 +1,61 @@
+{
+  "machines": [
+    {
+      "host": "evaldos-macbook-pro-16",
+      "id": "0531d99c39091d78534de686d51c6b64",
+      "name": "base-digital",
+      "session": "base-digital",
+      "state": "connected",
+      "target": "sh -c",
+      "temporary": false,
+      "version": "0.1.19",
+      "via": true
+    },
+    {
+      "host": "evaldos-macbook-pro-16",
+      "id": "82c216836371abb25291db972abc0962",
+      "name": "planet-argon",
+      "session": "planet-argon",
+      "state": "connected",
+      "target": "sh -c",
+      "temporary": false,
+      "version": "0.1.19",
+      "via": true
+    },
+    {
+      "host": "evaldos-macbook-pro-16",
+      "id": "5d08e99fc900639f3141377bca948660",
+      "name": "inovatec",
+      "session": "inovatec",
+      "state": "connected",
+      "target": "sh -c",
+      "temporary": false,
+      "version": "0.1.19",
+      "via": true
+    },
+    {
+      "host": "localhost",
+      "id": "9aac6d8ba228024e8e6531110b07d618",
+      "name": "abby-stg",
+      "session": null,
+      "since_ms": 1794262842553,
+      "state": "unreachable",
+      "target": "abby-stg",
+      "temporary": false,
+      "version": "0.1.16",
+      "via": false,
+      "why": "cannot reach abby-stg: ssh: connect to host 192.168.65.30 port 22: Operation timed out"
+    },
+    {
+      "host": "dev-home",
+      "id": "8d4a003f50c1efe47c29866c4ead22be",
+      "name": "dev-home",
+      "session": null,
+      "state": "connected",
+      "target": "dev-home",
+      "temporary": false,
+      "version": "0.1.19",
+      "via": false
+    }
+  ]
+}

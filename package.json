@@ -1,0 +1,31 @@
+{
+  "name": "hc-teleport",
+  "version": "0.1.0",
+  "description": "Move a coding-agent session between machines from an hc terminal",
+  "author": "Evaldo Klock",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "hc-teleport": "dist/src/app/cli.js"
+  },
+  "files": [
+    "dist/src"
+  ],
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit false --outDir dist"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "fast-check": "^4.10.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}
