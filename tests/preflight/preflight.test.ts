@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ProcessError, type Runner } from "../../src/platform/process.ts";
 import { HcError, type HcExecOptions, type HcExecResult } from "../../src/platform/hc.ts";
+import { LocalMachine } from "../../src/platform/machine.ts";
 import { preflight } from "../../src/preflight/index.ts";
 import { ClaudeAdapter } from "../../src/session/claude-adapter.ts";
 import type { SessionPlan } from "../../src/session/index.ts";
@@ -97,14 +98,14 @@ function planWith(overrides: { argv?: string[]; version?: string | null; cwd?: s
     session: { id: "09e11b42-f5c1-4c38-99f1-dd1d8b00355c", configDir: "/Users/mac/.claude", ...(version === null ? {} : { version }) },
     transcript: { file: "/Users/mac/.claude/projects/x/s.jsonl" },
     resume: { argv },
-    adapter: new ClaudeAdapter("/Users/mac"),
+    adapter: new ClaudeAdapter(new LocalMachine()),
   };
 }
 
 function run(state: Box, plan: SessionPlan) {
   const hc = new FakeHc(state);
   const source = sourceRunner(state);
-  const result = preflight({ plan, machine: MACHINE }, { hc, run: source.run, adapter: new ClaudeAdapter("/Users/mac") });
+  const result = preflight({ plan, machine: MACHINE }, { hc, run: source.run, adapter: new ClaudeAdapter(new LocalMachine()) });
   return { hc, source, result };
 }
 
@@ -196,7 +197,7 @@ describe("refuses a destination", () => {
         throw new HcError(`hc exec ${argv.join(" ")}: {"error":{"kind":"spawn_failed","message":"cannot start git: No such file or directory"}}`);
       },
     };
-    const result = await preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter("/Users/mac") });
+    const result = await preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter(new LocalMachine()) });
     expect(result).toMatchObject({
       ok: false,
       refusal: { reason: "dest_repo_missing", detail: expect.stringContaining("cannot start git") },
@@ -337,7 +338,7 @@ describe("only reads", () => {
         return ok(argv[0] === "git" ? `${CWD}\n` : `${HOME}\n`);
       },
     };
-    const result = await preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter("/Users/mac") });
+    const result = await preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter(new LocalMachine()) });
     expect(result).toMatchObject({ ok: false, refusal: { reason: "dest_executable_missing" } });
   });
 
@@ -347,7 +348,7 @@ describe("only reads", () => {
         throw new HcError("hc exec git on dev-home: machine unreachable");
       },
     };
-    await expect(preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter("/Users/mac") })).rejects.toThrow(
+    await expect(preflight({ plan: planWith(), machine: MACHINE }, { hc, run: sourceRunner(box()).run, adapter: new ClaudeAdapter(new LocalMachine()) })).rejects.toThrow(
       /unreachable/,
     );
   });

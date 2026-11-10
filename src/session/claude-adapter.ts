@@ -1,8 +1,7 @@
-import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 import type { HcTerminal } from "../platform/hc.ts";
-import { runProcess, type Runner } from "../platform/process.ts";
+import { MachineError, type Machine } from "../platform/machine.ts";
 import type {
   AdapterRefusalReason,
   AgentAdapter,
@@ -31,6 +30,9 @@ type Registry = z.infer<typeof registrySchema>;
 type Refusal = Extract<SessionResult, { ok: false }>;
 type DestinationRefusal = Extract<DestinationResult, { ok: false }>;
 type Version = readonly [number, number, number];
+
+/** A launcher that prints its config directory answers at once; one that hangs is not worth waiting for. */
+const LAUNCHER_TIMEOUT_S = 15;
 
 function refuseDestination(reason: DestinationRefusalReason, detail: string): DestinationRefusal {
   return { ok: false, refusal: { reason, detail } };
@@ -74,22 +76,15 @@ function projectDirName(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9]/g, "-");
 }
 
-async function isDirectory(path: string): Promise<boolean> {
-  try {
-    return (await stat(path)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-/** Claude Code behind an hc terminal: its session, the files that hold it and how to resume it. */
+/**
+ * Claude Code behind an hc terminal: its session, the files that hold it and how to resume it. The session is
+ * read through `source`, the machine the terminal runs on.
+ */
 export class ClaudeAdapter implements AgentAdapter {
-  readonly #home: string;
-  readonly #run: Runner;
+  readonly #source: Machine;
 
-  constructor(home: string, run: Runner = runProcess) {
-    this.#home = home;
-    this.#run = run;
+  constructor(source: Machine) {
+    this.#source = source;
   }
 
   recognizes(terminal: HcTerminal): boolean {
@@ -204,50 +199,60 @@ export class ClaudeAdapter implements AgentAdapter {
         `the registry entry of pid ${registry.pid} does not match the terminal's foreground process`,
       );
     }
-    return { ok: true, session: await this.#describe(configDir, registry) };
+    return this.#describe(configDir, registry);
   }
 
   async #configDir(launcher: string): Promise<string | Refusal> {
-    if (launcher === "claude") return join(this.#home, ".claude");
-    let output: string;
+    const machine = this.#source.name;
     try {
-      output = await this.#run(launcher, ["--where"]);
+      if (launcher === "claude") return join(await this.#source.home(), ".claude");
+      const where = await this.#source.exec([launcher, "--where"], { timeoutSeconds: LAUNCHER_TIMEOUT_S });
+      const printed = where.stdout.trim();
+      if (where.code !== 0) {
+        return refuse("config_dir_unknown", `${launcher} --where on ${machine} exited ${where.code}: ${where.stderr.trim()}`);
+      }
+      if (!isAbsolute(printed)) {
+        return refuse("config_dir_unknown", `${launcher} --where on ${machine} did not print an absolute path`);
+      }
+      return printed;
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      return refuse("config_dir_unknown", detail);
+      if (error instanceof MachineError) return refuse("config_dir_unknown", error.message);
+      throw error;
     }
-    const printed = output.trim();
-    if (!isAbsolute(printed)) {
-      return refuse("config_dir_unknown", `${launcher} --where did not print an absolute path`);
-    }
-    return printed;
   }
 
   async #readRegistry(configDir: string, pid: number): Promise<Registry | Refusal> {
     const file = join(configDir, "sessions", `${pid}.json`);
     let text: string;
     try {
-      text = await readFile(file, "utf8");
+      text = await this.#source.readFile(file);
     } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-        return refuse("no_session", `${file} does not exist`);
-      }
-      return refuse("session_registry_unreadable", `${file} cannot be read`);
+      if (!(error instanceof MachineError)) throw error;
+      if (error.code === "ENOENT") return refuse("no_session", `${file} does not exist on ${this.#source.name}`);
+      return refuse("session_registry_unreadable", `${file} cannot be read on ${this.#source.name}: ${error.message}`);
     }
     return parseRegistry(text, file);
   }
 
-  async #describe(configDir: string, registry: Registry): Promise<AgentSession> {
+  async #describe(configDir: string, registry: Registry): Promise<SessionResult> {
     const projectDir = join(configDir, "projects", projectDirName(registry.cwd));
     const subagentDir = join(projectDir, registry.sessionId);
-    return {
+    let kind;
+    try {
+      kind = await this.#source.kind(subagentDir);
+    } catch (error) {
+      if (!(error instanceof MachineError)) throw error;
+      return refuse("session_unreadable", `${subagentDir} cannot be read on ${this.#source.name}: ${error.message}`);
+    }
+    const session: AgentSession = {
       id: registry.sessionId,
       configDir,
       ...(registry.version === undefined ? {} : { version: registry.version }),
       transcript: {
         file: join(projectDir, `${registry.sessionId}.jsonl`),
-        ...((await isDirectory(subagentDir)) ? { dir: subagentDir } : {}),
+        ...(kind === "dir" ? { dir: subagentDir } : {}),
       },
     };
+    return { ok: true, session };
   }
 }

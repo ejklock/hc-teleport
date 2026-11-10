@@ -11,12 +11,13 @@ const PROFILE = `${DEST_HOME}/.claude-klock`;
 const DRIVER = `
 import { readFileSync } from "node:fs";
 import { Hc } from "${REPO_MOUNT}/src/platform/hc.ts";
+import { LocalMachine } from "${REPO_MOUNT}/src/platform/machine.ts";
 import { processRunner } from "${REPO_MOUNT}/src/platform/process.ts";
 import { preflight } from "${REPO_MOUNT}/src/preflight/index.ts";
 import { ClaudeAdapter } from "${REPO_MOUNT}/src/session/claude-adapter.ts";
 const plan = JSON.parse(readFileSync(0, "utf8"));
 try {
-  const result = await preflight({ plan, machine: "dest" }, { hc: new Hc(), run: processRunner(), adapter: new ClaudeAdapter("/Users/mac") });
+  const result = await preflight({ plan, machine: "dest" }, { hc: new Hc(), run: processRunner(), adapter: new ClaudeAdapter(new LocalMachine()) });
   process.stdout.write(JSON.stringify(result));
 } catch (error) {
   process.stdout.write(JSON.stringify({ failed: String(error?.message ?? error) }));

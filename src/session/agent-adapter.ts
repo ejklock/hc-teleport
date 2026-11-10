@@ -13,6 +13,7 @@ export type AdapterRefusalReason =
   | "no_session"
   | "session_registry_unreadable"
   | "session_registry_stale"
+  | "session_unreadable"
   | "session_mismatch"
   | "terminal_not_running"
   | "flag_not_allowed"

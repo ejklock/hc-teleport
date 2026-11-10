@@ -3,11 +3,76 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { HcTerminal } from "../../src/platform/hc.ts";
+import { LocalMachine, MachineError, type EntryKind, type ExecResult, type Machine, type MachineExecOptions, type MachineErrorCode } from "../../src/platform/machine.ts";
 import type { RemoteRun } from "../../src/session/agent-adapter.ts";
 import { ClaudeAdapter } from "../../src/session/claude-adapter.ts";
 
 const SESSION_ID = "09e11b42-f5c1-4c38-99f1-dd1d8b00355c";
 const FIXTURE = join(import.meta.dirname, "..", "fixtures", "hc-get-claude-klock.json");
+
+/** This host with a home of the test's choosing, so a plain `claude` reads under the fixture folder. */
+function macAt(homeDir: string): Machine {
+  return Object.assign(new LocalMachine(), { home: () => Promise.resolve(homeDir) });
+}
+
+/** A machine whose files, kinds and programs are what the test says; it records every program it ran. */
+class StubMachine implements Machine {
+  readonly name: string;
+  readonly files = new Map<string, string | MachineErrorCode>();
+  readonly kinds = new Map<string, EntryKind>();
+  readonly ran: (readonly string[])[] = [];
+  readonly limits: (number | undefined)[] = [];
+  kindFailure: MachineErrorCode | undefined;
+  where: ExecResult = { code: 0, stdout: "", stderr: "" };
+  homeDir = "/home/box";
+
+  constructor(name: string) {
+    this.name = name;
+  }
+
+  exec(argv: readonly string[], options: MachineExecOptions = {}): Promise<ExecResult> {
+    this.ran.push(argv);
+    this.limits.push(options.timeoutSeconds);
+    return Promise.resolve(this.where);
+  }
+
+  home(): Promise<string> {
+    return Promise.resolve(this.homeDir);
+  }
+
+  readFile(path: string): Promise<string> {
+    const content = this.files.get(path) ?? "ENOENT";
+    if (content === "ENOENT" || content === "not_text" || content === "failed") {
+      return Promise.reject(new MachineError(this.name, content, `read ${path}`));
+    }
+    return Promise.resolve(content);
+  }
+
+  kind(path: string): Promise<EntryKind | undefined> {
+    if (this.kindFailure !== undefined) return Promise.reject(new MachineError(this.name, this.kindFailure, `stat ${path}`));
+    return Promise.resolve(this.kinds.get(path));
+  }
+
+  writeFile(): Promise<void> {
+    return Promise.reject(new Error("a plan never writes"));
+  }
+
+  realpath(): Promise<string> {
+    return Promise.reject(new Error("a plan never resolves a path"));
+  }
+
+  entries(): Promise<never> {
+    return Promise.reject(new Error("a plan never lists a folder"));
+  }
+
+  makeTempDir(): Promise<string> {
+    return Promise.reject(new Error("a plan never makes a folder"));
+  }
+
+  remove(): Promise<void> {
+    return Promise.reject(new Error("a plan never removes anything"));
+  }
+}
 
 let root: string;
 let home: string;
@@ -53,7 +118,7 @@ describe("finds the session", () => {
     const configDir = join(home, ".claude-klock");
     await writeRegistry(configDir, pid, { pid, sessionId: SESSION_ID, cwd: base.cwd, version: "2.1.321", status: "busy" });
 
-    const result = await new ClaudeAdapter(home).findSession(launcherTerminal(base));
+    const result = await new ClaudeAdapter(macAt(home)).findSession(launcherTerminal(base));
 
     expect(result).toEqual({
       ok: true,
@@ -73,7 +138,7 @@ describe("finds the session", () => {
     const pid = base.foreground?.pid ?? 0;
     await writeRegistry(join(home, ".claude"), pid, { pid, sessionId: SESSION_ID, cwd: base.cwd });
 
-    const result = await new ClaudeAdapter(home).findSession({ ...base, argv: ["claude"] });
+    const result = await new ClaudeAdapter(macAt(home)).findSession({ ...base, argv: ["claude"] });
 
     expect(result.ok && result.session.configDir).toBe(join(home, ".claude"));
     expect(result.ok && result.session.version).toBeUndefined();
@@ -87,7 +152,7 @@ describe("finds the session", () => {
     const projectDir = join(configDir, "projects", "-Volumes-Developer-www-klock-tecnologia-hc-teleport");
     await mkdir(join(projectDir, SESSION_ID, "subagents"), { recursive: true });
 
-    const result = await new ClaudeAdapter(home).findSession(launcherTerminal(base));
+    const result = await new ClaudeAdapter(macAt(home)).findSession(launcherTerminal(base));
 
     expect(result.ok && result.session.transcript.dir).toBe(join(projectDir, SESSION_ID));
   });
@@ -100,7 +165,7 @@ describe("finds the session", () => {
     await writeRegistry(configDir, pid, { pid, sessionId: SESSION_ID, cwd });
     const foreground = base.foreground === undefined ? undefined : { ...base.foreground, cwd };
 
-    const result = await new ClaudeAdapter(home).findSession({
+    const result = await new ClaudeAdapter(macAt(home)).findSession({
       ...launcherTerminal(base),
       cwd,
       ...(foreground === undefined ? {} : { foreground }),
@@ -153,7 +218,7 @@ describe("finds the session", () => {
       const base = await terminalFixture();
       if (registry !== undefined) await writeRegistry(join(home, ".claude-klock"), pidOf(base), registry(base));
 
-      const result = await new ClaudeAdapter(home).findSession(launcherTerminal(base));
+      const result = await new ClaudeAdapter(macAt(home)).findSession(launcherTerminal(base));
 
       expect(result).toEqual({ ok: false, refusal: { reason, detail: expect.any(String) } });
     });
@@ -167,43 +232,148 @@ describe("finds the session", () => {
 
       await writeRegistry(join(home, ".claude-klock"), pid, { pid, sessionId: SESSION_ID, cwd: base.cwd });
       const foregroundMoved = { ...launcherTerminal(base), foreground: { ...foreground, cwd: "/elsewhere" } };
-      expect(await new ClaudeAdapter(home).findSession(foregroundMoved)).toEqual({ ok: false, refusal: stale });
+      expect(await new ClaudeAdapter(macAt(home)).findSession(foregroundMoved)).toEqual({ ok: false, refusal: stale });
 
       await writeRegistry(join(home, ".claude-klock"), pid, { pid, sessionId: SESSION_ID, cwd: foreground.cwd });
       const terminalMoved = { ...launcherTerminal(base), cwd: "/elsewhere" };
-      expect(await new ClaudeAdapter(home).findSession(terminalMoved)).toEqual({ ok: false, refusal: stale });
+      expect(await new ClaudeAdapter(macAt(home)).findSession(terminalMoved)).toEqual({ ok: false, refusal: stale });
     });
 
     it("a registry path that cannot be read as session_registry_unreadable", async () => {
       const base = await terminalFixture();
       await mkdir(join(home, ".claude-klock", "sessions", `${base.foreground?.pid ?? 0}.json`), { recursive: true });
 
-      const result = await new ClaudeAdapter(home).findSession(launcherTerminal(base));
+      const result = await new ClaudeAdapter(macAt(home)).findSession(launcherTerminal(base));
 
       expect(result).toEqual({ ok: false, refusal: { reason: "session_registry_unreadable", detail: expect.any(String) } });
     });
 
     it("a launcher whose --where fails as config_dir_unknown", async () => {
       await writeLauncher("exit 1");
-      const result = await new ClaudeAdapter(home).findSession(launcherTerminal(await terminalFixture()));
+      const result = await new ClaudeAdapter(macAt(home)).findSession(launcherTerminal(await terminalFixture()));
       expect(result).toEqual({ ok: false, refusal: { reason: "config_dir_unknown", detail: expect.any(String) } });
     });
 
     it("a launcher whose --where prints nothing as config_dir_unknown", async () => {
       await writeLauncher("exit 0");
-      const result = await new ClaudeAdapter(home).findSession(launcherTerminal(await terminalFixture()));
+      const result = await new ClaudeAdapter(macAt(home)).findSession(launcherTerminal(await terminalFixture()));
       expect(result).toEqual({ ok: false, refusal: { reason: "config_dir_unknown", detail: expect.any(String) } });
     });
 
     it("a foreground process that is not claude as not_claude", async () => {
       const base = await terminalFixture();
       const foreground = base.foreground === undefined ? undefined : { ...base.foreground, argv: ["node", "x.js"] };
-      const result = await new ClaudeAdapter(home).findSession({
+      const result = await new ClaudeAdapter(macAt(home)).findSession({
         ...launcherTerminal(base),
         ...(foreground === undefined ? {} : { foreground }),
       });
       expect(result).toEqual({ ok: false, refusal: { reason: "not_claude", detail: expect.any(String) } });
     });
+  });
+});
+
+describe("reads the session through the source machine", () => {
+  const registryFile = (configDir: string, base: HcTerminal): string => join(configDir, "sessions", `${base.foreground?.pid ?? 0}.json`);
+  const registryText = (base: HcTerminal): string =>
+    JSON.stringify({ pid: base.foreground?.pid ?? 0, sessionId: SESSION_ID, cwd: base.cwd, version: "2.1.321" });
+
+  it("running the launcher's --where on that machine and reading its registry there", async () => {
+    const base = await terminalFixture();
+    const machine = new StubMachine("dev-home");
+    machine.where = { code: 0, stdout: "/home/box/.claude-klock\n", stderr: "" };
+    machine.files.set(registryFile("/home/box/.claude-klock", base), registryText(base));
+
+    const result = await new ClaudeAdapter(machine).findSession({ ...base, argv: ["claude-klock", "a prompt"] });
+
+    expect(machine.ran).toEqual([["claude-klock", "--where"]]);
+    expect(machine.limits).toEqual([15]);
+    expect(result).toMatchObject({ ok: true, session: { id: SESSION_ID, configDir: "/home/box/.claude-klock" } });
+  });
+
+  it("mapping a plain claude to the home of that machine", async () => {
+    const base = await terminalFixture();
+    const machine = new StubMachine("dev-home");
+    machine.files.set(registryFile("/home/box/.claude", base), registryText(base));
+
+    const result = await new ClaudeAdapter(machine).findSession({ ...base, argv: ["claude"] });
+
+    expect(machine.ran).toEqual([]);
+    expect(result).toMatchObject({ ok: true, session: { configDir: "/home/box/.claude" } });
+  });
+
+  it("refusing a launcher that fails there as config_dir_unknown", async () => {
+    const base = await terminalFixture();
+    const machine = new StubMachine("dev-home");
+    machine.where = { code: 127, stdout: "", stderr: "not found" };
+
+    const result = await new ClaudeAdapter(machine).findSession({ ...base, argv: ["claude-klock"] });
+
+    expect(result).toEqual({ ok: false, refusal: { reason: "config_dir_unknown", detail: expect.stringContaining("not found") } });
+  });
+
+  it.each([
+    ["an absent registry", "ENOENT", "no_session"],
+    ["a registry that is not text", "not_text", "session_registry_unreadable"],
+    ["a registry the machine refuses to read", "failed", "session_registry_unreadable"],
+  ] as const)("refusing %s", async (_title, failure, reason) => {
+    const base = await terminalFixture();
+    const machine = new StubMachine("dev-home");
+    if (failure !== "ENOENT") machine.files.set(registryFile("/home/box/.claude", base), failure);
+
+    const result = await new ClaudeAdapter(machine).findSession({ ...base, argv: ["claude"] });
+
+    expect(result).toEqual({ ok: false, refusal: { reason, detail: expect.any(String) } });
+  });
+
+  it.each([
+    ["a folder", "dir", true],
+    ["a symlink", "symlink", false],
+    ["a file", "file", false],
+    ["nothing", undefined, false],
+  ] as const)("reporting the subagent folder only when the path is a folder (%s)", async (_title, kind, present) => {
+    const base = await terminalFixture();
+    const machine = new StubMachine("dev-home");
+    machine.files.set(registryFile("/home/box/.claude", base), registryText(base));
+    const folder = `/home/box/.claude/projects/-Volumes-Developer-www-klock-tecnologia-hc-teleport/${SESSION_ID}`;
+    if (kind !== undefined) machine.kinds.set(folder, kind);
+
+    const result = await new ClaudeAdapter(machine).findSession({ ...base, argv: ["claude"] });
+
+    expect(result.ok && result.session.transcript.dir).toBe(present ? folder : undefined);
+  });
+});
+
+describe("refuses a session whose folder the source cannot read as unreadable", () => {
+  const registryText = (base: HcTerminal): string => JSON.stringify({ pid: base.foreground?.pid ?? 0, sessionId: SESSION_ID, cwd: base.cwd });
+
+  it.each(["failed", "exec_failed"] as const)("when the machine rejects the folder with %s", async (failure) => {
+    const base = await terminalFixture();
+    const machine = new StubMachine("dev-home");
+    machine.files.set(`/home/box/.claude/sessions/${base.foreground?.pid ?? 0}.json`, registryText(base));
+    machine.kindFailure = failure;
+
+    const result = await new ClaudeAdapter(machine).findSession({ ...base, argv: ["claude"] });
+
+    const folder = `/home/box/.claude/projects/-Volumes-Developer-www-klock-tecnologia-hc-teleport/${SESSION_ID}`;
+    expect(result).toEqual({ ok: false, refusal: { reason: "session_unreadable", detail: expect.stringContaining(folder) } });
+  });
+
+  it.skipIf(process.getuid?.() === 0)("when a folder above the session folder on the Mac has mode 000", async () => {
+    const base = await terminalFixture();
+    const pid = base.foreground?.pid ?? 0;
+    const configDir = join(home, ".claude");
+    await writeRegistry(configDir, pid, { pid, sessionId: SESSION_ID, cwd: base.cwd });
+    const projectDir = join(configDir, "projects", "-Volumes-Developer-www-klock-tecnologia-hc-teleport");
+    await mkdir(projectDir, { recursive: true });
+    await chmod(projectDir, 0o000);
+
+    try {
+      const result = await new ClaudeAdapter(macAt(home)).findSession({ ...base, argv: ["claude"] });
+
+      expect(result).toEqual({ ok: false, refusal: { reason: "session_unreadable", detail: expect.stringContaining(SESSION_ID) } });
+    } finally {
+      await chmod(projectDir, 0o755);
+    }
   });
 });
 
@@ -247,14 +417,14 @@ describe("confirms the session resumed", () => {
     const terminal = await live();
     const { remote } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
 
-    expect(await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
+    expect(await new ClaudeAdapter(macAt(home)).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
   });
 
   it("an agent started through a wrapper whose terminal argv[0] is the wrapper", async () => {
     const terminal = { ...(await live()), argv: ["claude-klock", "--resume", SESSION_ID] };
     const { remote } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
 
-    expect(await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
+    expect(await new ClaudeAdapter(macAt(home)).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
   });
 
   it("a folder with a space and non-ASCII characters", async () => {
@@ -263,7 +433,7 @@ describe("confirms the session resumed", () => {
     const terminal = { ...base, cwd, ...(base.foreground === undefined ? {} : { foreground: { ...base.foreground, cwd } }) };
     const { remote } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
 
-    expect(await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
+    expect(await new ClaudeAdapter(macAt(home)).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
   });
 
   describe("refuses", () => {
@@ -326,7 +496,7 @@ describe("confirms the session resumed", () => {
       const subject = terminal === undefined ? base : terminal(base);
       const { remote } = stubRemote(file === undefined ? {} : { [registryPath(pidOf(base))]: file(base) });
 
-      const result = await new ClaudeAdapter(home).confirmResumed(subject, expected, remote);
+      const result = await new ClaudeAdapter(macAt(home)).confirmResumed(subject, expected, remote);
 
       expect(result).toEqual({ ok: false, refusal: { reason, detail: expect.any(String) } });
       for (const part of detail ?? []) expect(result.ok ? "" : result.refusal.detail).toContain(part);
@@ -340,20 +510,20 @@ describe("confirms the session resumed", () => {
       const stale = { ok: false, refusal: { reason: "session_registry_stale", detail: expect.any(String) } };
 
       const terminalOnly = stubRemote({ [registryPath(pidOf(base))]: entry(base, { cwd: base.cwd }) });
-      expect(await new ClaudeAdapter(home).confirmResumed(moved, expected, terminalOnly.remote)).toEqual(stale);
+      expect(await new ClaudeAdapter(macAt(home)).confirmResumed(moved, expected, terminalOnly.remote)).toEqual(stale);
 
       const foregroundOnly = stubRemote({ [registryPath(pidOf(base))]: entry(base, { cwd: "/elsewhere" }) });
-      expect(await new ClaudeAdapter(home).confirmResumed(moved, expected, foregroundOnly.remote)).toEqual(stale);
+      expect(await new ClaudeAdapter(macAt(home)).confirmResumed(moved, expected, foregroundOnly.remote)).toEqual(stale);
 
       const both = stubRemote({ [registryPath(pidOf(base))]: entry(base, { cwd: "/elsewhere" }) });
       const bothMoved = { ...moved, cwd: "/elsewhere" };
-      expect(await new ClaudeAdapter(home).confirmResumed(bothMoved, expected, both.remote)).toEqual({ ok: true });
+      expect(await new ClaudeAdapter(macAt(home)).confirmResumed(bothMoved, expected, both.remote)).toEqual({ ok: true });
     });
 
     it("a registry file removed after a failed read as no_session", async () => {
       const gone: RemoteRun = { machine: "dev-home", run: async () => ({ code: 1, stdout: "", stderr: "No such file" }) };
 
-      const result = await new ClaudeAdapter(home).confirmResumed(await live(), expected, gone);
+      const result = await new ClaudeAdapter(macAt(home)).confirmResumed(await live(), expected, gone);
 
       expect(result).toEqual({ ok: false, refusal: { reason: "no_session", detail: expect.any(String) } });
     });
@@ -362,7 +532,7 @@ describe("confirms the session resumed", () => {
       const terminal = await live();
       const { remote, argvs } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
 
-      await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote);
+      await new ClaudeAdapter(macAt(home)).confirmResumed(terminal, expected, remote);
 
       expect(argvs.map((argv) => argv[0])).toEqual(["cat"]);
     });
@@ -373,7 +543,7 @@ describe("confirms the session resumed", () => {
         run: async (argv) => (argv[0] === "test" ? { code: 0, stdout: "", stderr: "" } : { code: 1, stdout: "", stderr: "denied" }),
       };
 
-      const result = await new ClaudeAdapter(home).confirmResumed(await live(), expected, failing);
+      const result = await new ClaudeAdapter(macAt(home)).confirmResumed(await live(), expected, failing);
 
       expect(result).toEqual({ ok: false, refusal: { reason: "session_registry_unreadable", detail: expect.any(String) } });
     });
@@ -383,15 +553,15 @@ describe("confirms the session resumed", () => {
     const failure = new Error("hc is down");
     const remote: RemoteRun = { machine: "dev-home", run: async () => Promise.reject(failure) };
 
-    await expect(new ClaudeAdapter(home).confirmResumed(await live(), expected, remote)).rejects.toBe(failure);
+    await expect(new ClaudeAdapter(macAt(home)).confirmResumed(await live(), expected, remote)).rejects.toBe(failure);
   });
 
   it("only reads, with the path after -- and never as an option", async () => {
     const terminal = await live();
     const { remote, argvs } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
 
-    await new ClaudeAdapter(home).confirmResumed(terminal, { sessionId: SESSION_ID, configDir: "-odd dir" }, remote);
-    await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote);
+    await new ClaudeAdapter(macAt(home)).confirmResumed(terminal, { sessionId: SESSION_ID, configDir: "-odd dir" }, remote);
+    await new ClaudeAdapter(macAt(home)).confirmResumed(terminal, expected, remote);
 
     expect(argvs.length).toBeGreaterThan(0);
     for (const argv of argvs) {

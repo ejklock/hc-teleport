@@ -8,7 +8,7 @@ import { planSession, type SessionPlan } from "../session/index.ts";
 
 const EXIT = { ok: 0, failed: 1, usage: 2, refused: 3, rolledBack: 4 } as const;
 
-const USAGE = "usage: hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]";
+const USAGE = "usage: hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]\n  <terminal> is tN on the Mac or <machine>/tN on an hc machine; <machine> is an hc machine, or local for the Mac";
 
 const DEFAULT_TIMEOUT_S = 120;
 const MIN_TIMEOUT_S = 1;
@@ -22,6 +22,7 @@ function renderPlan(plan: SessionPlan): string {
   const version = plan.session.version === undefined ? "" : ` (Claude Code ${plan.session.version})`;
   return [
     `terminal    ${plan.terminal}`,
+    `source      ${plan.source ?? "local"}`,
     `machine     ${plan.machine}`,
     `cwd         ${plan.cwd}`,
     `session     ${plan.session.id}${version}`,
@@ -35,6 +36,8 @@ function renderPlan(plan: SessionPlan): string {
 function jsonPlan(plan: SessionPlan): unknown {
   return {
     terminal: plan.terminal,
+    // A session on the Mac prints as it always has; only another source is named.
+    ...(plan.source === undefined || plan.source === "local" ? {} : { source: plan.source }),
     machine: plan.machine,
     cwd: plan.cwd,
     session: plan.session,
@@ -137,10 +140,33 @@ async function main(args: readonly string[]): Promise<number> {
   try {
     return parsed.values["dry-run"] === true
       ? await dryRun(terminal, machine, json)
-      : report(await moveSession({ terminal, machine, timeoutSeconds }, { hc: new Hc(), run: processRunner(), home: homedir() }), json);
+      : await move({ terminal, machine, timeoutSeconds }, json);
   } catch (error) {
     return failure(error, json);
   }
+}
+
+async function move(request: { terminal: string; machine: string; timeoutSeconds: number }, json: boolean): Promise<number> {
+  if (request.terminal.includes("/")) return refuseRemoteSource(request, json);
+  return report(await moveSession(request, { hc: new Hc(), run: processRunner(), home: homedir() }), json);
+}
+
+class RemoteSource extends Error {}
+
+/**
+ * A terminal address with a `/` is malformed or names an hc machine. The plan's own address parse tells them
+ * apart without asking hc: a malformed address refuses before hc is read, and a well-formed one reaches hc,
+ * which here fails at once. Only the other direction can be planned, not yet run.
+ */
+async function refuseRemoteSource(request: { terminal: string; machine: string }, json: boolean): Promise<number> {
+  const neverAsked = new Hc(() => Promise.reject(new RemoteSource()));
+  try {
+    const planned = await planSession(request, { hc: neverAsked, home: homedir() });
+    if (!planned.ok) return refuse(planned.refusal, json);
+  } catch (error) {
+    if (!(error instanceof RemoteSource)) throw error;
+  }
+  return refuse({ reason: "way_back_not_ready", detail: `${request.terminal} does not run on the Mac; only --dry-run plans a move to the Mac` }, json);
 }
 
 async function dryRun(terminal: string, machine: string, json: boolean): Promise<number> {

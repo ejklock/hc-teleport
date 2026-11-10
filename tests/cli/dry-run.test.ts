@@ -11,6 +11,40 @@ const CLI = join(ROOT, "src", "app", "cli.ts");
 const SESSION_ID = "09e11b42-f5c1-4c38-99f1-dd1d8b00355c";
 const PROJECT_DIR = "-Volumes-Developer-www-klock-tecnologia-hc-teleport";
 
+/**
+ * Stands in for `hc exec` and `hc file read` on dev-home: the remote machine is this host, so its home is
+ * the scratch HOME. It answers `find -P <path> -maxdepth 0 -printf %y`, which the host's own find cannot.
+ */
+const REMOTE_HC = `
+import { lstatSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const args = process.argv.slice(2);
+const rest = args.slice(args.indexOf("--") + 1);
+const b64 = (text) => Buffer.from(text).toString("base64");
+const print = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const reply = (code, out, err) => print({ code, stdout: b64(out), stderr: b64(err), timed_out: false, truncated: false });
+if (args[0] === "file") {
+  try {
+    const text = readFileSync(rest[0], "utf8");
+    const lines = text.split("\\n").length;
+    print({ text, last: lines, lines });
+  } catch (error) {
+    process.stderr.write(JSON.stringify({ error: { kind: error.code === "ENOENT" ? "not_found" : "failed", message: error.message } }));
+    process.exit(1);
+  }
+} else if (rest[0] === "find") {
+  try {
+    const stat = lstatSync(rest[2]);
+    reply(0, stat.isSymbolicLink() ? "l" : stat.isDirectory() ? "d" : "f", "");
+  } catch (error) {
+    reply(1, "", "find: '" + rest[2] + "': " + (error.code === "ENOENT" ? "No such file or directory" : "Permission denied"));
+  }
+} else {
+  const ran = spawnSync(rest[0], rest.slice(1), { encoding: "utf8" });
+  reply(ran.status ?? 1, ran.stdout, ran.stderr);
+}
+`;
+
 type Run = { code: number; stdout: string; stderr: string };
 
 let scratch: string;
@@ -80,9 +114,12 @@ beforeEach(async () => {
 case "$1 $2 $3" in
   "get t6c --json") cat "$FAKE_STATE/get.json" ;;
   "machine ls --json") cat "$FAKE_STATE/machines.json" ;;
+  "get "*"/t6c --json") cat "$FAKE_STATE/get.json" ;;
+  "exec --json --on=dev-home"|"file read --json") "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac`,
   );
+  await writeFile(join(bin, "remote.mjs"), REMOTE_HC);
   await script(join(bin, "claude-klock"), `[ "$1" = "--where" ] && printf '%s\\n' "${home}/.claude-klock"`);
   terminal = await parseTerminal(await fixture("hc-get-claude-klock.json"));
   await withStatus({ app: "claude-code", state: "done" });
@@ -179,6 +216,135 @@ describe("prints the session plan of an idle Claude terminal", () => {
     await cli("t6c", "dev-home", "--dry-run", "--json");
 
     expect(await tree(home)).toEqual(before);
+  });
+});
+
+describe("dry-run of a session that runs on an hc machine", () => {
+  it("prints the plan read on that machine as one JSON object", async () => {
+    const configDir = join(home, ".claude-klock");
+    await registry(configDir);
+
+    const run = await cli("dev-home/t6c", "local", "--dry-run", "--json");
+
+    expect(run.code).toBe(0);
+    expect(JSON.parse(run.stdout)).toEqual({
+      terminal: "dev-home/t6c",
+      source: "dev-home",
+      machine: "local",
+      cwd: terminal.cwd,
+      session: { id: SESSION_ID, configDir, version: "2.1.321" },
+      transcript: { file: join(configDir, "projects", PROJECT_DIR, `${SESSION_ID}.jsonl`), dir: null },
+      resume: { argv: ["claude-klock", "--resume", SESSION_ID] },
+    });
+  });
+
+  it("reports the subagent folder it finds on that machine", async () => {
+    const configDir = join(home, ".claude-klock");
+    await registry(configDir);
+    const dir = join(configDir, "projects", PROJECT_DIR, SESSION_ID);
+    await mkdir(join(dir, "subagents"), { recursive: true });
+
+    const run = await cli("dev-home/t6c", "local", "--dry-run", "--json");
+
+    expect(JSON.parse(run.stdout).transcript.dir).toBe(dir);
+  });
+
+  it("names both ends readably without --json", async () => {
+    await registry(join(home, ".claude-klock"));
+
+    const run = await cli("dev-home/t6c", "local", "--dry-run");
+
+    expect(run.code).toBe(0);
+    expect(run.stdout).toMatch(/^source\s+dev-home$/m);
+    expect(run.stdout).toMatch(/^machine\s+local$/m);
+    expect(run.stderr).toBe("");
+  });
+
+  it("refuses a registry that is not there on that machine as no_session", async () => {
+    const run = await cli("dev-home/t6c", "local", "--dry-run", "--json");
+
+    expect(run.code).toBe(3);
+    expect(JSON.parse(run.stdout).refused.reason).toBe("no_session");
+  });
+});
+
+describe("dry-run refuses a move without the Mac at exactly one end", () => {
+  it.each([
+    ["the Mac to itself", ["t6c", "local"], "same_machine"],
+    ["a machine to itself", ["dev-home/t6c", "dev-home"], "same_machine"],
+    ["one machine to another", ["dev-home/t6c", "base-digital"], "mac_not_an_end"],
+    ["a source that is not listed", ["ghost/t6c", "local"], "unknown_machine"],
+    ["a source that is not connected", ["abby-stg/t6c", "local"], "machine_unreachable"],
+    ["an address with no terminal", ["dev-home/", "local"], "terminal_not_running"],
+    ["an address with a machine name missing", ["/t6c", "dev-home"], "terminal_not_running"],
+  ])("for %s as exit 3", async (_title, [terminalArg = "", machineArg = ""], reason) => {
+    await registry(join(home, ".claude-klock"));
+
+    const json = await cli(terminalArg, machineArg, "--dry-run", "--json");
+    const text = await cli(terminalArg, machineArg, "--dry-run");
+
+    expect(json.code).toBe(3);
+    expect(JSON.parse(json.stdout)).toEqual({ refused: { reason, detail: expect.any(String) } });
+    expect(text.code).toBe(3);
+    expect(text.stdout).toBe("");
+    expect(text.stderr).toContain(reason);
+  });
+
+  it("when hc lists a machine named local as local_name_taken", async () => {
+    const listed = await fixture("hc-machine-ls.json");
+    await writeFile(join(state, "machines.json"), JSON.stringify({ machines: [...(listed["machines"] as unknown[]), { name: "local", state: "connected" }] }));
+
+    const run = await cli("t6c", "dev-home", "--dry-run", "--json");
+
+    expect(run.code).toBe(3);
+    expect(JSON.parse(run.stdout)).toEqual({ refused: { reason: "local_name_taken", detail: expect.stringContaining("local") } });
+  });
+});
+
+describe("a move without --dry-run of a session that is not on the Mac (way_back_not_ready)", () => {
+  it("refuses as way_back_not_ready and runs nothing", async () => {
+    await writeFile(join(state, "hc-fails"), "");
+
+    const json = await cli("dev-home/t6c", "local", "--json");
+    const text = await cli("dev-home/t6c", "local");
+
+    expect(json.code).toBe(3);
+    expect(JSON.parse(json.stdout)).toEqual({ refused: { reason: "way_back_not_ready", detail: expect.any(String) } });
+    expect(text.code).toBe(3);
+    expect(text.stderr).toContain("way_back_not_ready");
+  });
+
+  it.each(["/t6c", "local/t6c", "a/b/t6c", "dev-home/"])("refuses the malformed address %s as terminal_not_running, as --dry-run does", async (address) => {
+    await writeFile(join(state, "hc-fails"), "");
+
+    const move = await cli(address, "local", "--json");
+    const dry = await cli(address, "local", "--dry-run", "--json");
+
+    expect(move.code).toBe(3);
+    expect(JSON.parse(move.stdout)).toEqual({ refused: { reason: "terminal_not_running", detail: expect.any(String) } });
+    expect(dry.code).toBe(move.code);
+    expect(dry.stdout).toBe(move.stdout);
+  });
+});
+
+describe("dry-run refuses a session whose folder cannot be read as session_unreadable", () => {
+  it.skipIf(process.getuid?.() === 0)("on the Mac and on an hc machine", async () => {
+    const configDir = join(home, ".claude-klock");
+    await registry(configDir);
+    const projectDir = join(configDir, "projects", PROJECT_DIR);
+    await mkdir(projectDir, { recursive: true });
+    await chmod(projectDir, 0o000);
+
+    try {
+      for (const args of [["t6c", "dev-home"], ["dev-home/t6c", "local"]]) {
+        const run = await cli(...args, "--dry-run", "--json");
+
+        expect(run.code, args.join(" ")).toBe(3);
+        expect(JSON.parse(run.stdout)).toEqual({ refused: { reason: "session_unreadable", detail: expect.stringContaining(SESSION_ID) } });
+      }
+    } finally {
+      await chmod(projectDir, 0o755);
+    }
   });
 });
 
