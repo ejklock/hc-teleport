@@ -113,11 +113,11 @@ export async function carryGit(request: GitCarryRequest, deps: GitCarryDeps): Pr
 }
 
 /**
- * Puts the destination checkout back as it was before the carry: the branch it was on (or the detached commit), the
- * carried branch where it stood or gone when the carry created it, the index and tracked files at that commit, the
- * untracked files the carry created removed, and the carry's refs deleted. What to rewind is decided from what the
+ * Puts the destination checkout back as it was before the carry: the branch it was on (unborn when it had no commit) or the detached commit, the
+ * carried branch where it stood or gone when the carry created it, the index and tracked files at that commit (with no
+ * commit, every tracked file is removed, ignored or not), the untracked files the carry created removed, and the carry's refs deleted. What to rewind is decided from what the
  * destination holds now, never from the step that failed: a step reported as failed may still have run. A destination
- * already where it was before the carry only loses the refs. Ignored files are never touched. Edits made on the
+ * already where it was before the carry only loses the refs. Ignored files the carry did not track are never touched. Edits made on the
  * destination after the carry are lost with the carry's own. Calling it again, once the refs are gone, changes nothing.
  * Refuses an id that is not a UUID or a ref outside `refs/hc-teleport/<id>/`, changing nothing.
  */
@@ -232,7 +232,6 @@ class Destination {
   /** The checkout is not where the carry found it: HEAD, the carried branch, or the index, tracked or untracked files differ. */
   async movedFrom(carried: CarriedState): Promise<boolean> {
     const { previousBranch, previousHead, branch, branchPreviousHead } = carried;
-    if (previousHead === undefined) return true;
     const now = await this.previousState();
     return (
       now.previousBranch !== previousBranch ||
@@ -245,21 +244,37 @@ class Destination {
   /** Moves HEAD and the carried branch back, then the index and tracked files to HEAD, then removes what the carry left untracked. */
   async rewind(carried: CarriedState): Promise<void> {
     const { previousBranch, previousHead, branch, branchPreviousHead } = carried;
-    if (previousHead === undefined) {
-      throw new Error(`cannot undo the carry on ${this.#machine} at ${this.#cwd}: the checkout had no commit before it`);
-    }
-    if (previousBranch === undefined) {
+    if (previousBranch !== undefined) {
+      this.#ok(await this.#git(["symbolic-ref", "HEAD", `refs/heads/${previousBranch}`]), "point HEAD at its branch");
+    } else if (previousHead !== undefined) {
       this.#ok(await this.#git(["update-ref", "--no-deref", "HEAD", previousHead]), "detach HEAD");
     } else {
-      this.#ok(await this.#git(["symbolic-ref", "HEAD", `refs/heads/${previousBranch}`]), "point HEAD at its branch");
+      throw new Error(`cannot undo the carry on ${this.#machine} at ${this.#cwd}: it recorded neither a branch nor a commit`);
     }
     if (branchPreviousHead === undefined) {
       this.#ok(await this.#git(["update-ref", "-d", `refs/heads/${branch}`]), `delete branch ${branch}`);
     } else {
       this.#ok(await this.#git(["update-ref", `refs/heads/${branch}`, branchPreviousHead]), `restore branch ${branch}`);
     }
-    this.#ok(await this.#git(["read-tree", "-u", "--reset", previousHead]), "read-tree of the previous commit");
+    if (previousHead === undefined) {
+      await this.#removeTracked();
+    } else {
+      this.#ok(await this.#git(["read-tree", "-u", "--reset", previousHead]), "read-tree of the previous commit");
+    }
     await this.#removeUntracked();
+  }
+
+  /**
+   * The checkout had no commit and was clean, so its index was empty and every tracked path now is the carry's, ignored or not.
+   * Each is dropped from the index and the disk together; `--exclude-standard` listing would miss the ignored ones.
+   */
+  async #removeTracked(): Promise<void> {
+    const listed = this.#ok(await this.#git(["ls-files", "-z"]), "list tracked files");
+    const paths = listed.stdout.split("\0").filter((path) => path !== "");
+    for (let from = 0; from < paths.length; from += CLEAN_BATCH) {
+      const batch = paths.slice(from, from + CLEAN_BATCH);
+      this.#ok(await this.#git(["rm", "-r", "-f", "-q", "--", ...batch], ["--literal-pathspecs"]), "remove tracked files");
+    }
   }
 
   /** The checkout was clean before the carry, so every untracked file now is the carry's. Removed one by one, so folders that were already there stay. */

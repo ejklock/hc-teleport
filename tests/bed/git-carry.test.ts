@@ -523,6 +523,28 @@ describe("git carry from source to dest through the real hc and ssh", () => {
       await expectUndone(path, dropped as unknown as Failed, before, id);
     });
 
+    it("undoes a carry onto a destination checkout that had no commit", async () => {
+      sequence += 1;
+      const path = `${BED_PROJECT_ROOT}/carry-${sequence}`;
+      await sh("source", BED_PROJECT_ROOT, `git init -q -b main ${path}`);
+      await sh(
+        "source",
+        path,
+        `printf 'ignored.log\\n' > .gitignore && printf 'one\\n' > tracked.txt && printf 'gone\\n' > gone-staged.txt && printf '#!/bin/sh\\n' > run.sh && git add -A && git ${GIT_USER.join(" ")} commit -q -m first`,
+      );
+      await sh("dest", BED_PROJECT_ROOT, `git init -q -b main ${path}`);
+      await sh("dest", path, "printf 'ignored.log\\n' >> .git/info/exclude");
+      await sourceWithEveryChange(path);
+      await withIgnoredFile(path);
+      const id = randomUUID();
+      const before = await destFingerprint(path);
+      const outcome = await expectCarried(path, id);
+      expect((await sh("dest", path, "git rev-parse --verify -q HEAD")).trim()).not.toBe("");
+      await expectUndone(path, outcome, before, id);
+      expect((await sh("dest", path, "git for-each-ref refs/hc-teleport/")).trim()).toBe("");
+      expect((await sh("dest", path, "cat ignored.log")).trim()).toBe("keep me");
+    });
+
     it("undoes a carry that failed at the checkout, leaving another process's index lock alone", async () => {
       const path = await twinRepositories();
       await destWithLockedIndex(path);

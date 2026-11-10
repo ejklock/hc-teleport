@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { carryGit, undoGitCarry, type GitCarryDeps, type GitCarryOutcome } from "../../src/git-carry/carry.ts";
 import { HcError } from "../../src/platform/hc.ts";
@@ -92,7 +92,7 @@ describe("undoGitCarry undoes from what the destination holds", () => {
   function fingerprint(): string {
     return [
       git(["for-each-ref"]),
-      git(["rev-parse", "HEAD"]),
+      spawnSync("git", ["-C", repo, "rev-parse", "--verify", "-q", "HEAD"], { encoding: "utf8" }).stdout,
       spawnSync("git", ["-C", repo, "symbolic-ref", "-q", "HEAD"], { encoding: "utf8" }).stdout,
       git(["ls-files", "-s"]),
       git(["status", "--porcelain=v2", "-z", "--untracked-files=all"]),
@@ -226,6 +226,146 @@ describe("undoGitCarry undoes from what the destination holds", () => {
     expect(refsLeft(id)).toBe("");
     await undoGitCarry(outcome, undoDeps);
     expect(fingerprint()).toBe(before);
+  });
+
+  describe("on a destination with no commit", () => {
+    interface UnbornOptions {
+      /** Tracked paths the source force-adds, whatever its ignore rules say. */
+      forced?: string[];
+      /** The source's `.gitignore`, carried with the commit. */
+      sourceIgnore?: string;
+      /** Lines added to the destination's `.git/info/exclude`. */
+      destExclude?: string;
+      /** Files the destination holds before the carry, by path. */
+      preexisting?: Record<string, string>;
+    }
+
+    /** A destination made by `git init` with one ignored file, and the carry's refs fetched onto it from the source. */
+    function unbornDestination(id: string, unbornBranch: string, carriedBranch: string, options: UnbornOptions = {}) {
+      const source = repo;
+      git(["checkout", "-q", "-b", "scratch"]);
+      writeFileSync(join(source, "carried.txt"), "carried\n");
+      if (options.sourceIgnore !== undefined) writeFileSync(join(source, ".gitignore"), options.sourceIgnore);
+      for (const path of options.forced ?? []) {
+        mkdirSync(dirname(join(source, path)), { recursive: true });
+        writeFileSync(join(source, path), `carried ${path}\n`);
+        git(["--literal-pathspecs", "add", "-f", "--", path]);
+      }
+      git(["add", "-A"]);
+      git(["commit", "-q", "-m", "carried"]);
+      const carriedHead = git(["rev-parse", "HEAD"]).trim();
+      repo = join(realpathSync(root), "dest");
+      mkdirSync(repo);
+      git(["init", "-q", "-b", unbornBranch]);
+      writeFileSync(join(repo, ".git", "info", "exclude"), `ignored.log\n${options.destExclude ?? ""}`);
+      writeFileSync(join(repo, "ignored.log"), "kept\n");
+      for (const [path, content] of Object.entries(options.preexisting ?? {})) {
+        mkdirSync(dirname(join(repo, path)), { recursive: true });
+        writeFileSync(join(repo, path), content);
+      }
+      const before = fingerprint();
+      const refs = ["head", "staged", "worktree"].map((name) => `refs/hc-teleport/${id}/${name}`);
+      git(["fetch", "-q", source, `refs/heads/scratch:${refs[0]}`]);
+      git(["update-ref", refs[1] ?? "", carriedHead]);
+      git(["update-ref", refs[2] ?? "", carriedHead]);
+      const state = {
+        machine: "dest",
+        id,
+        cwd: repo,
+        refs,
+        previousBranch: unbornBranch,
+        branch: carriedBranch,
+        carried: { head: carriedHead, staged: carriedHead, worktree: carriedHead },
+      };
+      return { before, carriedHead, state };
+    }
+
+    /** What the carry's checkout and working-tree read-tree leave behind: the branch, a staged file, an untracked file and an edit. */
+    function checkedOut(branch: string, head: string): void {
+      git(["checkout", "-q", "-B", branch, head, "--"]);
+      writeFileSync(join(repo, "carried-staged.txt"), "staged\n");
+      git(["add", "carried-staged.txt"]);
+      writeFileSync(join(repo, "carried-new.txt"), "new\n");
+      writeFileSync(join(repo, "carried.txt"), "edited\n");
+    }
+
+    it.each([
+      ["a carried outcome onto the unborn branch of the same name", "main", "main", "carried"],
+      ["a carried outcome onto an unborn branch of another name", "trunk", "feature", "carried"],
+      ["a failed checkout where nothing moved", "trunk", "feature", "nothing"],
+      ["a failed read-tree of the working tree after the checkout ran", "main", "main", "read-tree"],
+      ["a failed read-tree of the working tree on another branch name", "trunk", "feature", "read-tree"],
+    ])("puts the checkout back after %s, and changes nothing on a second call", async (_title, unborn, branch, ran) => {
+      const id = randomUUID();
+      const { before, carriedHead, state } = unbornDestination(id, unborn, branch);
+      if (ran !== "nothing") checkedOut(branch, carriedHead);
+      const outcome: Extract<GitCarryOutcome, { status: "carried" | "failed" }> =
+        ran === "carried"
+          ? { status: "carried", ...state }
+          : { status: "failed", step: ran === "nothing" ? "checkout" : "read-tree of the working tree", detail: "dropped", ...state };
+
+      await undoGitCarry(outcome, undoDeps);
+
+      expect(fingerprint()).toBe(before);
+      expect(refsLeft(id)).toBe("");
+      expect(git(["ls-files", "-s"])).toBe("");
+      await undoGitCarry(outcome, undoDeps);
+      expect(fingerprint()).toBe(before);
+    });
+
+    it.each([
+      ["a carried .gitignore", { forced: [".vscode/settings.json"], sourceIgnore: ".vscode/\n" }, "carried"],
+      [
+        "the destination's own exclude file, beside a pre-existing ignored file",
+        { forced: [".vscode/settings.json"], destExclude: ".vscode/\n", preexisting: { ".vscode/keep.json": "{\"a\": 1}\n" } },
+        "carried",
+      ],
+      ["a name with a space, a newline and a leading dash", { forced: ["-odd dir/a\nb -c.txt"], sourceIgnore: "-odd*/\n" }, "carried"],
+      ["a failed read-tree of the working tree", { forced: [".vscode/settings.json"], sourceIgnore: ".vscode/\n" }, "read-tree"],
+    ])("removes every carried tracked file that an ignore rule matches, through %s", async (_title, options, ran) => {
+      const id = randomUUID();
+      const { before, carriedHead, state } = unbornDestination(id, "main", "main", options);
+      checkedOut("main", carriedHead);
+      const outcome: Extract<GitCarryOutcome, { status: "carried" | "failed" }> =
+        ran === "carried"
+          ? { status: "carried", ...state }
+          : { status: "failed", step: "read-tree of the working tree", detail: "dropped", ...state };
+      for (const path of options.forced) expect(existsSync(join(repo, path))).toBe(true);
+
+      await undoGitCarry(outcome, undoDeps);
+
+      expect(fingerprint()).toBe(before);
+      expect(refsLeft(id)).toBe("");
+      for (const path of options.forced) expect(existsSync(join(repo, path))).toBe(false);
+      for (const [path, content] of Object.entries("preexisting" in options ? options.preexisting : {})) {
+        expect(readFileSync(join(repo, path), "utf8")).toBe(content);
+      }
+      await undoGitCarry(outcome, undoDeps);
+      expect(fingerprint()).toBe(before);
+    });
+
+    it.each([
+      ["tracked", true],
+      ["untracked", false],
+    ])("removes carried %s files whose names start like pathspec magic", async (_title, tracked) => {
+      const id = randomUUID();
+      const names = [":!x.txt", ":(top)y.txt"];
+      const { before, carriedHead, state } = unbornDestination(id, "main", "main", tracked ? { forced: names } : {});
+      checkedOut("main", carriedHead);
+      if (!tracked) for (const name of names) writeFileSync(join(repo, name), "untracked\n");
+      for (const name of names) expect(existsSync(join(repo, name))).toBe(true);
+      expect(git(["--literal-pathspecs", "ls-files", "-z"]).includes(":!x.txt")).toBe(tracked);
+      expect(process.env["GIT_LITERAL_PATHSPECS"]).toBeUndefined();
+      const outcome: Extract<GitCarryOutcome, { status: "carried" | "failed" }> = { status: "carried", ...state };
+
+      await undoGitCarry(outcome, undoDeps);
+
+      for (const name of names) expect(existsSync(join(repo, name))).toBe(false);
+      expect(fingerprint()).toBe(before);
+      expect(refsLeft(id)).toBe("");
+      await undoGitCarry(outcome, undoDeps);
+      expect(fingerprint()).toBe(before);
+    });
   });
 
   it("refuses an id that is not a UUID and a ref outside the carry's namespace, changing nothing", async () => {
