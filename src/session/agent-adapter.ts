@@ -13,6 +13,8 @@ export type AdapterRefusalReason =
   | "no_session"
   | "session_registry_unreadable"
   | "session_registry_stale"
+  | "session_mismatch"
+  | "terminal_not_running"
   | "flag_not_allowed"
   | "flag_missing_value";
 
@@ -49,6 +51,15 @@ export type DestinationResult =
   | { ok: true; configDir: string; version: string }
   | { ok: false; refusal: DestinationRefusal };
 
+export type ResumeExpectation = {
+  /** The session the destination terminal must be running. */
+  sessionId: string;
+  /** The agent's config directory on the destination, from `checkDestination`. */
+  configDir: string;
+};
+
+export type ResumeConfirmation = { ok: true } | { ok: false; refusal: AdapterRefusal };
+
 /** What the core needs from a coding agent; each agent enters through one implementation. */
 export interface AgentAdapter {
   /** Whether the terminal is running this agent. */
@@ -62,4 +73,10 @@ export interface AgentAdapter {
    * profile directory exists and its version is not older than the source's. Read-only.
    */
   checkDestination(request: DestinationRequest, remote: RemoteRun): Promise<DestinationResult>;
+  /**
+   * Whether a destination terminal resumed the expected session: it is live, its foreground
+   * is this agent and the agent's session registry on the destination names that session for
+   * that process and folder. Read-only; a failing remote run rejects.
+   */
+  confirmResumed(terminal: HcTerminal, expected: ResumeExpectation, remote: RemoteRun): Promise<ResumeConfirmation>;
 }

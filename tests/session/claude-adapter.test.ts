@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { HcTerminal } from "../../src/platform/hc.ts";
+import type { RemoteRun } from "../../src/session/agent-adapter.ts";
 import { ClaudeAdapter } from "../../src/session/claude-adapter.ts";
 
 const SESSION_ID = "09e11b42-f5c1-4c38-99f1-dd1d8b00355c";
@@ -203,5 +204,201 @@ describe("finds the session", () => {
       });
       expect(result).toEqual({ ok: false, refusal: { reason: "not_claude", detail: expect.any(String) } });
     });
+  });
+});
+
+describe("confirms the session resumed", () => {
+  const DEST_CONFIG = "/home/dev/.claude-klock";
+  const OTHER_ID = "11111111-2222-4333-8444-555555555555";
+  const registryPath = (pid: number): string => `${DEST_CONFIG}/sessions/${pid}.json`;
+  const expected = { sessionId: SESSION_ID, configDir: DEST_CONFIG };
+
+  type Stub = { remote: RemoteRun; argvs: (readonly string[])[] };
+
+  function stubRemote(files: Record<string, string>): Stub {
+    const argvs: (readonly string[])[] = [];
+    const remote: RemoteRun = {
+      machine: "dev-home",
+      async run(argv) {
+        argvs.push(argv);
+        const [program, ...rest] = argv;
+        if (program === "test" && rest[0] === "-e") {
+          return { code: rest[1] !== undefined && rest[1] in files ? 0 : 1, stdout: "", stderr: "" };
+        }
+        if (program === "cat" && rest[0] === "--") {
+          const text = files[rest[1] ?? ""];
+          return text === undefined ? { code: 1, stdout: "", stderr: "No such file" } : { code: 0, stdout: text, stderr: "" };
+        }
+        return { code: 127, stdout: "", stderr: "unexpected command" };
+      },
+    };
+    return { remote, argvs };
+  }
+
+  async function live(): Promise<HcTerminal> {
+    return { ...(await terminalFixture()), argv: ["claude", "--resume", SESSION_ID] };
+  }
+
+  const pidOf = (terminal: HcTerminal): number => terminal.foreground?.pid ?? 0;
+  const entry = (terminal: HcTerminal, over: Record<string, unknown> = {}): string =>
+    JSON.stringify({ pid: pidOf(terminal), sessionId: SESSION_ID, cwd: terminal.cwd, version: "2.1.321", ...over });
+
+  it("an agent started directly whose registry names the expected session", async () => {
+    const terminal = await live();
+    const { remote } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
+
+    expect(await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
+  });
+
+  it("an agent started through a wrapper whose terminal argv[0] is the wrapper", async () => {
+    const terminal = { ...(await live()), argv: ["claude-klock", "--resume", SESSION_ID] };
+    const { remote } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
+
+    expect(await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
+  });
+
+  it("a folder with a space and non-ASCII characters", async () => {
+    const base = await live();
+    const cwd = "/home/dev/meu projeto/ação";
+    const terminal = { ...base, cwd, ...(base.foreground === undefined ? {} : { foreground: { ...base.foreground, cwd } }) };
+    const { remote } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
+
+    expect(await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote)).toEqual({ ok: true });
+  });
+
+  describe("refuses", () => {
+    type Case = {
+      title: string;
+      reason: string;
+      terminal?: (base: HcTerminal) => HcTerminal;
+      file?: (base: HcTerminal) => string;
+      detail?: string[];
+    };
+    const cases: Case[] = [
+      {
+        title: "a finished terminal with its exit code",
+        reason: "terminal_not_running",
+        terminal: (b) => ({ ...b, state: "finished", exit_code: 137 }),
+        file: entry,
+        detail: ["137"],
+      },
+      {
+        title: "a finished terminal without an exit code",
+        reason: "terminal_not_running",
+        terminal: (b) => ({ ...b, state: "finished" }),
+        file: entry,
+      },
+      {
+        title: "a foreground that is not the agent",
+        reason: "not_claude",
+        terminal: (b) => ({ ...b, ...(b.foreground === undefined ? {} : { foreground: { ...b.foreground, argv: ["zsh"] } }) }),
+        file: entry,
+      },
+      {
+        title: "an absent foreground",
+        reason: "not_claude",
+        terminal: ({ foreground: _gone, ...rest }) => rest,
+        file: entry,
+      },
+      { title: "an absent registry file", reason: "no_session" },
+      { title: "a registry that is not JSON", reason: "session_registry_unreadable", file: () => "{not json" },
+      {
+        title: "a registry of another shape",
+        reason: "session_registry_unreadable",
+        file: (b) => JSON.stringify({ pid: pidOf(b), cwd: b.cwd }),
+      },
+      { title: "a registry of another pid", reason: "session_registry_stale", file: (b) => entry(b, { pid: pidOf(b) + 1 }) },
+      {
+        title: "a registry of another folder",
+        reason: "session_registry_stale",
+        file: (b) => entry(b, { cwd: `${b.cwd}/other` }),
+      },
+      {
+        title: "a registry of another session",
+        reason: "session_mismatch",
+        file: (b) => entry(b, { sessionId: OTHER_ID }),
+        detail: [SESSION_ID, OTHER_ID],
+      },
+    ];
+
+    it.each(cases)("$title as $reason", async ({ reason, terminal, file, detail }) => {
+      const base = await live();
+      const subject = terminal === undefined ? base : terminal(base);
+      const { remote } = stubRemote(file === undefined ? {} : { [registryPath(pidOf(base))]: file(base) });
+
+      const result = await new ClaudeAdapter(home).confirmResumed(subject, expected, remote);
+
+      expect(result).toEqual({ ok: false, refusal: { reason, detail: expect.any(String) } });
+      for (const part of detail ?? []) expect(result.ok ? "" : result.refusal.detail).toContain(part);
+    });
+
+    it("a registry that matches only one of the two cwds as session_registry_stale", async () => {
+      const base = await live();
+      const foreground = base.foreground;
+      if (foreground === undefined) throw new Error("the fixture has no foreground process");
+      const moved = { ...base, foreground: { ...foreground, cwd: "/elsewhere" } };
+      const stale = { ok: false, refusal: { reason: "session_registry_stale", detail: expect.any(String) } };
+
+      const terminalOnly = stubRemote({ [registryPath(pidOf(base))]: entry(base, { cwd: base.cwd }) });
+      expect(await new ClaudeAdapter(home).confirmResumed(moved, expected, terminalOnly.remote)).toEqual(stale);
+
+      const foregroundOnly = stubRemote({ [registryPath(pidOf(base))]: entry(base, { cwd: "/elsewhere" }) });
+      expect(await new ClaudeAdapter(home).confirmResumed(moved, expected, foregroundOnly.remote)).toEqual(stale);
+
+      const both = stubRemote({ [registryPath(pidOf(base))]: entry(base, { cwd: "/elsewhere" }) });
+      const bothMoved = { ...moved, cwd: "/elsewhere" };
+      expect(await new ClaudeAdapter(home).confirmResumed(bothMoved, expected, both.remote)).toEqual({ ok: true });
+    });
+
+    it("a registry file removed after a failed read as no_session", async () => {
+      const gone: RemoteRun = { machine: "dev-home", run: async () => ({ code: 1, stdout: "", stderr: "No such file" }) };
+
+      const result = await new ClaudeAdapter(home).confirmResumed(await live(), expected, gone);
+
+      expect(result).toEqual({ ok: false, refusal: { reason: "no_session", detail: expect.any(String) } });
+    });
+
+    it("a registry that is read without asking whether it exists", async () => {
+      const terminal = await live();
+      const { remote, argvs } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
+
+      await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote);
+
+      expect(argvs.map((argv) => argv[0])).toEqual(["cat"]);
+    });
+
+    it("a registry file that exists but cannot be read as session_registry_unreadable", async () => {
+      const failing: RemoteRun = {
+        machine: "dev-home",
+        run: async (argv) => (argv[0] === "test" ? { code: 0, stdout: "", stderr: "" } : { code: 1, stdout: "", stderr: "denied" }),
+      };
+
+      const result = await new ClaudeAdapter(home).confirmResumed(await live(), expected, failing);
+
+      expect(result).toEqual({ ok: false, refusal: { reason: "session_registry_unreadable", detail: expect.any(String) } });
+    });
+  });
+
+  it("propagates the error of a remote run that rejects", async () => {
+    const failure = new Error("hc is down");
+    const remote: RemoteRun = { machine: "dev-home", run: async () => Promise.reject(failure) };
+
+    await expect(new ClaudeAdapter(home).confirmResumed(await live(), expected, remote)).rejects.toBe(failure);
+  });
+
+  it("only reads, with the path after -- and never as an option", async () => {
+    const terminal = await live();
+    const { remote, argvs } = stubRemote({ [registryPath(pidOf(terminal))]: entry(terminal) });
+
+    await new ClaudeAdapter(home).confirmResumed(terminal, { sessionId: SESSION_ID, configDir: "-odd dir" }, remote);
+    await new ClaudeAdapter(home).confirmResumed(terminal, expected, remote);
+
+    expect(argvs.length).toBeGreaterThan(0);
+    for (const argv of argvs) {
+      const [program, ...rest] = argv;
+      if (program === "cat") expect(rest[0]).toBe("--");
+      else expect(program).toBe("test");
+      expect(rest.filter((arg) => arg.startsWith("-") && arg !== "--" && arg !== "-e")).toEqual([]);
+    }
   });
 });

@@ -12,6 +12,8 @@ import type {
   DestinationResult,
   RemoteRun,
   ResumeArgvResult,
+  ResumeConfirmation,
+  ResumeExpectation,
   SessionResult,
 } from "./agent-adapter.ts";
 import { buildResumeArgv } from "./resume-argv.ts";
@@ -46,6 +48,20 @@ function isOlder(version: Version, reference: Version): boolean {
     if (part !== other) return part < other;
   }
   return false;
+}
+
+function parseRegistry(text: string, file: string): Registry | Refusal {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return refuse("session_registry_unreadable", `${file} is not valid JSON`);
+  }
+  const parsed = registrySchema.safeParse(json);
+  if (!parsed.success) {
+    return refuse("session_registry_unreadable", `${file} has an unknown shape: ${parsed.error.message}`);
+  }
+  return parsed.data;
 }
 
 function refuse(reason: AdapterRefusalReason, detail: string): Refusal {
@@ -117,6 +133,46 @@ export class ClaudeAdapter implements AgentAdapter {
     return { ok: true, configDir, version: version.join(".") };
   }
 
+  async confirmResumed(terminal: HcTerminal, expected: ResumeExpectation, remote: RemoteRun): Promise<ResumeConfirmation> {
+    if (terminal.state !== "live") {
+      const code = terminal.exit_code === undefined ? "" : ` with exit code ${terminal.exit_code}`;
+      return refuse("terminal_not_running", `${terminal.address} on ${remote.machine} is ${terminal.state}${code}`);
+    }
+    const foreground = terminal.foreground;
+    if (foreground === undefined || !this.recognizes(terminal)) {
+      return refuse("not_claude", `the foreground process of ${terminal.address} on ${remote.machine} is not claude`);
+    }
+    const registry = await this.#readRemoteRegistry(expected.configDir, foreground.pid, remote);
+    if ("ok" in registry) return registry;
+    if (registry.pid !== foreground.pid || registry.cwd !== foreground.cwd || registry.cwd !== terminal.cwd) {
+      return refuse(
+        "session_registry_stale",
+        `the registry entry of pid ${registry.pid} does not match the foreground process of ${terminal.address}`,
+      );
+    }
+    if (registry.sessionId !== expected.sessionId) {
+      return refuse(
+        "session_mismatch",
+        `${terminal.address} on ${remote.machine} runs session ${registry.sessionId}, expected ${expected.sessionId}`,
+      );
+    }
+    return { ok: true };
+  }
+
+  async #readRemoteRegistry(configDir: string, pid: number, remote: RemoteRun): Promise<Registry | Refusal> {
+    // Both commands take the path as an operand; an absolute path cannot read as an option.
+    if (!isAbsolute(configDir)) return refuse("session_registry_unreadable", `the config dir ${configDir} is not an absolute path`);
+    const file = join(configDir, "sessions", `${pid}.json`);
+    const read = await remote.run(["cat", "--", file]);
+    if (read.code !== 0) {
+      // Only a failed read asks whether the file exists, so a file removed mid-check still reads as absent.
+      const exists = await remote.run(["test", "-e", file]);
+      if (exists.code !== 0) return refuse("no_session", `${file} does not exist on ${remote.machine}`);
+      return refuse("session_registry_unreadable", `${file} cannot be read on ${remote.machine}`);
+    }
+    return parseRegistry(read.stdout, file);
+  }
+
   async #destinationConfigDir(executable: string, home: string, remote: RemoteRun): Promise<string | DestinationRefusal> {
     let configDir = `${home}/.claude`;
     if (executable !== "claude") {
@@ -178,17 +234,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }
       return refuse("session_registry_unreadable", `${file} cannot be read`);
     }
-    let json: unknown;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      return refuse("session_registry_unreadable", `${file} is not valid JSON`);
-    }
-    const parsed = registrySchema.safeParse(json);
-    if (!parsed.success) {
-      return refuse("session_registry_unreadable", `${file} has an unknown shape: ${parsed.error.message}`);
-    }
-    return parsed.data;
+    return parseRegistry(text, file);
   }
 
   async #describe(configDir: string, registry: Registry): Promise<AgentSession> {
