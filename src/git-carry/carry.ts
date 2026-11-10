@@ -16,8 +16,10 @@ export type GitCarryRequest = {
 export type GitCarryRefusal = SourceRefusal | "machine_without_ssh" | "dest_repo_missing" | "dest_dirty" | "dest_diverged";
 
 /** What a carry leaves on the destination once its refs are pushed. */
-type CarriedState = {
+export type CarriedState = {
   machine: string;
+  /** The session id the refs are named by. */
+  id: string;
   /** The repository's top level, the checkout that was worked on; the same path on both machines. */
   cwd: string;
   /** The refs written on the destination, all under `refs/hc-teleport/<id>/`. */
@@ -25,6 +27,12 @@ type CarriedState = {
   /** What the destination checkout was on before; absent when detached or without a commit. */
   previousBranch?: string;
   previousHead?: string;
+  /** The branch the carry moved or created on the destination. */
+  branch: string;
+  /** Where that branch stood on the destination before the carry; absent when the carry created it. */
+  branchPreviousHead?: string;
+  /** The commits the source was carried as: its HEAD, its index and its working tree. */
+  carried: { head: string; staged: string; worktree: string };
 };
 
 export type GitCarryOutcome =
@@ -41,10 +49,11 @@ export type GitCarryOutcome =
 
 const PUSH_TIMEOUT_MS = 600_000;
 const DEST_TIMEOUT_S = 300;
+const CLEAN_BATCH = 100;
 
 const idSchema = z.uuid();
 
-const refNames = (id: string): { head: string; staged: string; worktree: string } => ({
+export const refNames = (id: string): { head: string; staged: string; worktree: string } => ({
   head: `refs/hc-teleport/${id}/head`,
   staged: `refs/hc-teleport/${id}/staged`,
   worktree: `refs/hc-teleport/${id}/worktree`,
@@ -77,6 +86,7 @@ export async function carryGit(request: GitCarryRequest, deps: GitCarryDeps): Pr
   if (refusal !== undefined) return { status: "refused", reason: refusal };
 
   const previous = await dest.previousState();
+  const branchPreviousHead = await dest.branchHead(snapshot.branch);
   const refs = refNames(id);
   // Forced: nothing but this carry writes under this session's id, and an earlier attempt may have left its refs.
   const pushed = [
@@ -88,17 +98,40 @@ export async function carryGit(request: GitCarryRequest, deps: GitCarryDeps): Pr
     timeoutMs: PUSH_TIMEOUT_MS,
   });
 
-  const state: CarriedState = { machine, cwd: root, refs: Object.values(refs), ...previous };
+  const state: CarriedState = {
+    machine,
+    id,
+    cwd: root,
+    refs: Object.values(refs),
+    ...previous,
+    branch: snapshot.branch,
+    ...(branchPreviousHead === undefined ? {} : { branchPreviousHead }),
+    carried: { head: snapshot.head, staged: snapshot.staged, worktree: snapshot.worktree },
+  };
   const failure = await dest.restore(snapshot, refs);
   return failure === undefined ? { status: "carried", ...state } : { status: "failed", ...failure, ...state };
 }
 
-/** Deletes the refs a carry wrote on the destination and no other, after it carried or failed; deleting what is already gone is not an error. */
-export async function removeCarriedRefs(
+/**
+ * Puts the destination checkout back as it was before the carry: the branch it was on (or the detached commit), the
+ * carried branch where it stood or gone when the carry created it, the index and tracked files at that commit, the
+ * untracked files the carry created removed, and the carry's refs deleted. What to rewind is decided from what the
+ * destination holds now, never from the step that failed: a step reported as failed may still have run. A destination
+ * already where it was before the carry only loses the refs. Ignored files are never touched. Edits made on the
+ * destination after the carry are lost with the carry's own. Calling it again, once the refs are gone, changes nothing.
+ * Refuses an id that is not a UUID or a ref outside `refs/hc-teleport/<id>/`, changing nothing.
+ */
+export async function undoGitCarry(
   carried: Extract<GitCarryOutcome, { status: "carried" | "failed" }>,
   deps: Pick<GitCarryDeps, "hc">,
 ): Promise<void> {
+  const id = idSchema.parse(carried.id);
+  const namespace = `refs/hc-teleport/${id}/`;
+  const outside = carried.refs.find((ref) => !ref.startsWith(namespace) || ref.includes(".."));
+  if (outside !== undefined) throw new Error(`refusing to delete ${outside}: it is not under ${namespace}`);
   const dest = new Destination(deps.hc, carried.machine, carried.cwd);
+  if (!(await dest.hasAnyRef(carried.refs))) return;
+  if (await dest.movedFrom(carried)) await dest.rewind(carried);
   for (const ref of carried.refs) await dest.deleteRef(ref);
 }
 
@@ -189,12 +222,62 @@ class Destination {
     return undefined;
   }
 
+  async hasAnyRef(refs: readonly string[]): Promise<boolean> {
+    for (const ref of refs) {
+      if ((await this.#optional(["rev-parse", "--verify", "-q", ref])) !== undefined) return true;
+    }
+    return false;
+  }
+
+  /** The checkout is not where the carry found it: HEAD, the carried branch, or the index, tracked or untracked files differ. */
+  async movedFrom(carried: CarriedState): Promise<boolean> {
+    const { previousBranch, previousHead, branch, branchPreviousHead } = carried;
+    if (previousHead === undefined) return true;
+    const now = await this.previousState();
+    return (
+      now.previousBranch !== previousBranch ||
+      now.previousHead !== previousHead ||
+      (await this.branchHead(branch)) !== branchPreviousHead ||
+      (await this.isDirty())
+    );
+  }
+
+  /** Moves HEAD and the carried branch back, then the index and tracked files to HEAD, then removes what the carry left untracked. */
+  async rewind(carried: CarriedState): Promise<void> {
+    const { previousBranch, previousHead, branch, branchPreviousHead } = carried;
+    if (previousHead === undefined) {
+      throw new Error(`cannot undo the carry on ${this.#machine} at ${this.#cwd}: the checkout had no commit before it`);
+    }
+    if (previousBranch === undefined) {
+      this.#ok(await this.#git(["update-ref", "--no-deref", "HEAD", previousHead]), "detach HEAD");
+    } else {
+      this.#ok(await this.#git(["symbolic-ref", "HEAD", `refs/heads/${previousBranch}`]), "point HEAD at its branch");
+    }
+    if (branchPreviousHead === undefined) {
+      this.#ok(await this.#git(["update-ref", "-d", `refs/heads/${branch}`]), `delete branch ${branch}`);
+    } else {
+      this.#ok(await this.#git(["update-ref", `refs/heads/${branch}`, branchPreviousHead]), `restore branch ${branch}`);
+    }
+    this.#ok(await this.#git(["read-tree", "-u", "--reset", previousHead]), "read-tree of the previous commit");
+    await this.#removeUntracked();
+  }
+
+  /** The checkout was clean before the carry, so every untracked file now is the carry's. Removed one by one, so folders that were already there stay. */
+  async #removeUntracked(): Promise<void> {
+    const listed = this.#ok(await this.#git(["ls-files", "-z", "--others", "--exclude-standard"]), "list untracked files");
+    const paths = listed.stdout.split("\0").filter((path) => path !== "");
+    for (let from = 0; from < paths.length; from += CLEAN_BATCH) {
+      const batch = paths.slice(from, from + CLEAN_BATCH);
+      this.#ok(await this.#git(["clean", "-f", "-d", "-q", "--", ...batch], ["--literal-pathspecs"]), "clean untracked files");
+    }
+  }
+
   async deleteRef(ref: string): Promise<void> {
     this.#ok(await this.#git(["update-ref", "-d", ref]), `delete ${ref}`);
   }
 
-  #git(args: readonly string[]): Promise<HcExecResult> {
-    return this.#hc.exec(["git", "-C", this.#cwd, ...args], { on: this.#machine, timeout: DEST_TIMEOUT_S });
+  #git(args: readonly string[], options: readonly string[] = []): Promise<HcExecResult> {
+    return this.#hc.exec(["git", "-C", this.#cwd, ...options, ...args], { on: this.#machine, timeout: DEST_TIMEOUT_S });
   }
 
   async #optional(args: readonly string[]): Promise<string | undefined> {

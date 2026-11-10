@@ -31,10 +31,13 @@ const GIT_USER = ["-c", "user.name=bed", "-c", "user.email=bed@example.test"];
 type Carried = {
   status: "carried";
   machine: string;
+  id: string;
   cwd: string;
   refs: string[];
   previousBranch?: string;
   previousHead?: string;
+  branch: string;
+  branchPreviousHead?: string;
 };
 type Failed = Omit<Carried, "status"> & { status: "failed"; step: string; detail: string };
 type Refused = { status: "refused"; reason: string };
@@ -235,7 +238,7 @@ describe("git carry from source to dest through the real hc and ssh", () => {
       expect(outcome.refs).toHaveLength(3);
       expect(await destCheckout(path)).toBe(before);
 
-      await call("removeCarriedRefs", outcome);
+      await call("undoGitCarry", outcome);
       expect(await carriedRefs(path)).toBe("");
     });
 
@@ -255,7 +258,7 @@ describe("git carry from source to dest through the real hc and ssh", () => {
       expect((await sh("dest", path, "git rev-parse HEAD")).trim()).not.toBe(previous);
       await sh("dest", path, "chmod 755 locked");
 
-      await call("removeCarriedRefs", outcome);
+      await call("undoGitCarry", outcome);
       expect(await carriedRefs(path)).toBe("");
     });
 
@@ -413,6 +416,127 @@ describe("git carry from source to dest through the real hc and ssh", () => {
     });
   });
 
+  describe("undoes", () => {
+    /** The destination as a person or git would compare it: refs, HEAD, index, status, and every ignored file's bytes. */
+    function destFingerprint(path: string): Promise<string> {
+      return sh(
+        "dest",
+        path,
+        [
+          "git for-each-ref",
+          "git symbolic-ref -q HEAD || git rev-parse HEAD",
+          "git ls-files -s",
+          "git --no-optional-locks status --porcelain=v2 -z --untracked-files=all | od -c",
+          "git ls-files -z --others --ignored --exclude-standard | xargs -0 -r sha1sum --",
+        ].join("; echo ---; "),
+      );
+    }
+
+    async function withIgnoredFile(path: string): Promise<void> {
+      await sh("dest", path, "printf 'keep me\\n' > ignored.log");
+    }
+
+    async function expectUndone(path: string, outcome: Carried | Failed, before: string, id: string): Promise<void> {
+      await call("undoGitCarry", outcome);
+      expect(await destFingerprint(path)).toBe(before);
+      expect(await carriedRefs(path, `${id}/`)).toBe("");
+      await call("undoGitCarry", outcome);
+      expect(await destFingerprint(path)).toBe(before);
+    }
+
+    async function sourceWithEveryChange(path: string): Promise<void> {
+      await sh("source", path, "printf 'edit\\n' > tracked.txt && git rm -q gone-staged.txt && printf 'fresh\\n' > fresh.txt && mkdir -p sub/deeper && printf 'x\\n' > 'sub/deeper/é f.txt' && chmod 755 run.sh && ln -s tracked.txt link");
+    }
+
+    it("undoes a carry onto another branch when the carried branch did not exist there", async () => {
+      const path = await twinRepositories();
+      await sh("source", path, "git checkout -q -b feature/new");
+      await commitOnSource(path, "feature.txt", "feature");
+      await sourceWithEveryChange(path);
+      await withIgnoredFile(path);
+      const id = randomUUID();
+      const otherId = randomUUID();
+      await sh("dest", path, `git update-ref refs/hc-teleport/${otherId}/head HEAD`);
+      const before = await destFingerprint(path);
+      const outcome = await expectCarried(path, id);
+      await expectUndone(path, outcome, before, id);
+      expect(await carriedRefs(path, `${otherId}/`)).toContain(otherId);
+    });
+
+    it("undoes a fast-forward carry onto the carried branch at an older commit", async () => {
+      const path = await twinRepositories();
+      await commitOnSource(path, "second.txt", "two");
+      await sourceWithEveryChange(path);
+      await withIgnoredFile(path);
+      const id = randomUUID();
+      const before = await destFingerprint(path);
+      const outcome = await expectCarried(path, id);
+      await expectUndone(path, outcome, before, id);
+    });
+
+    it("undoes a carry onto another branch while the carried branch existed at an older commit", async () => {
+      const path = await twinRepositories();
+      await sh("dest", path, "git checkout -q -b other");
+      await commitOnSource(path, "second.txt", "two");
+      await sourceWithEveryChange(path);
+      await withIgnoredFile(path);
+      const id = randomUUID();
+      const before = await destFingerprint(path);
+      const outcome = await expectCarried(path, id);
+      await expectUndone(path, outcome, before, id);
+    });
+
+    it("undoes a carry onto a detached destination", async () => {
+      const path = await twinRepositories();
+      await sh("dest", path, "git checkout -q --detach");
+      await commitOnSource(path, "second.txt", "two");
+      await sourceWithEveryChange(path);
+      const id = randomUUID();
+      const before = await destFingerprint(path);
+      const outcome = await expectCarried(path, id);
+      await expectUndone(path, outcome, before, id);
+    });
+
+    it("undoes a carry that failed in the working tree after the checkout moved the branch", async () => {
+      const path = await twinRepositories();
+      await commitOnSource(path, "second.txt", "two");
+      await sh("source", path, "mkdir locked && printf 'new\\n' > locked/new.txt");
+      await sh("dest", path, "mkdir locked && chmod 555 locked");
+      await withIgnoredFile(path);
+      const id = randomUUID();
+      const before = await destFingerprint(path);
+      const outcome = (await carryGit(path, id)) as Failed;
+      expect(outcome.status).toBe("failed");
+      await sh("dest", path, "chmod 755 locked");
+      await expectUndone(path, outcome, before, id);
+    });
+
+    it("undoes a carry reported as failed at the checkout although the checkout ran", async () => {
+      const path = await twinRepositories();
+      await commitOnSource(path, "second.txt", "two");
+      await sourceWithEveryChange(path);
+      await withIgnoredFile(path);
+      const id = randomUUID();
+      const before = await destFingerprint(path);
+      const outcome = await expectCarried(path, id);
+      const dropped = { ...outcome, status: "failed" as const, step: "checkout", detail: "the connection dropped" };
+      await expectUndone(path, dropped as unknown as Failed, before, id);
+    });
+
+    it("undoes a carry that failed at the checkout, leaving another process's index lock alone", async () => {
+      const path = await twinRepositories();
+      await destWithLockedIndex(path);
+      await withIgnoredFile(path);
+      await commitOnSource(path, "second.txt", "two");
+      const id = randomUUID();
+      const before = await destFingerprint(path);
+      const outcome = (await carryGit(path, id)) as Failed;
+      expect(outcome).toMatchObject({ status: "failed", step: "checkout" });
+      await expectUndone(path, outcome, before, id);
+      expect((await sh("dest", path, "test -e .git/index.lock && echo locked")).trim()).toBe("locked");
+    });
+  });
+
   describe("removes", () => {
     it("removes exactly the refs the carry wrote and nothing else, twice over", async () => {
       const path = await twinRepositories();
@@ -422,13 +546,13 @@ describe("git carry from source to dest through the real hc and ssh", () => {
       const carried = await expectCarried(path, randomUUID());
       const before = (await sh("dest", path, "git for-each-ref --format='%(refname)'")).trim().split("\n");
 
-      await call("removeCarriedRefs", carried);
+      await call("undoGitCarry", carried);
       const after = (await sh("dest", path, "git for-each-ref --format='%(refname)'")).trim().split("\n");
       expect(after).toEqual(before.filter((ref) => !carried.refs.includes(ref)));
       expect(after).toContain(`refs/hc-teleport/${otherId}/head`);
       expect(after).toContain("refs/heads/keep");
 
-      await call("removeCarriedRefs", carried);
+      await call("undoGitCarry", carried);
       expect((await sh("dest", path, "git for-each-ref --format='%(refname)'")).trim().split("\n")).toEqual(after);
     });
   });
