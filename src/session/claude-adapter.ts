@@ -7,6 +7,10 @@ import type {
   AdapterRefusalReason,
   AgentAdapter,
   AgentSession,
+  DestinationRefusalReason,
+  DestinationRequest,
+  DestinationResult,
+  RemoteRun,
   ResumeArgvResult,
   SessionResult,
 } from "./agent-adapter.ts";
@@ -23,6 +27,26 @@ const registrySchema = z.object({
 
 type Registry = z.infer<typeof registrySchema>;
 type Refusal = Extract<SessionResult, { ok: false }>;
+type DestinationRefusal = Extract<DestinationResult, { ok: false }>;
+type Version = readonly [number, number, number];
+
+function refuseDestination(reason: DestinationRefusalReason, detail: string): DestinationRefusal {
+  return { ok: false, refusal: { reason, detail } };
+}
+
+// Claude Code prints "2.1.321 (Claude Code)"; only the leading three integers count.
+function parseVersion(text: string): Version | undefined {
+  const found = /^\s*(\d+)\.(\d+)\.(\d+)(?!\d)/.exec(text);
+  return found === null ? undefined : [Number(found[1]), Number(found[2]), Number(found[3])];
+}
+
+function isOlder(version: Version, reference: Version): boolean {
+  for (const [index, part] of version.entries()) {
+    const other = reference[index] ?? 0;
+    if (part !== other) return part < other;
+  }
+  return false;
+}
 
 function refuse(reason: AdapterRefusalReason, detail: string): Refusal {
   return { ok: false, refusal: { reason, detail } };
@@ -58,6 +82,54 @@ export class ClaudeAdapter implements AgentAdapter {
 
   buildResumeArgv(source: readonly string[], sessionId: string): ResumeArgvResult {
     return buildResumeArgv(source, sessionId);
+  }
+
+  async checkDestination(request: DestinationRequest, remote: RemoteRun): Promise<DestinationResult> {
+    const { executable, home } = request;
+    const printed = await remote.run([executable, "--version"]);
+    if (printed.code !== 0) {
+      const why = printed.stderr.trim() || `exit ${printed.code}`;
+      return refuseDestination("dest_executable_missing", `${executable} does not run on ${remote.machine}: ${why}`);
+    }
+    const configDir = await this.#destinationConfigDir(executable, home, remote);
+    if (typeof configDir !== "string") return configDir;
+
+    const version = parseVersion(printed.stdout);
+    if (version === undefined) {
+      return refuseDestination(
+        "dest_agent_version_unknown",
+        `${executable} --version on ${remote.machine} printed no major.minor.patch: ${printed.stdout.trim()}`,
+      );
+    }
+    const source = request.sourceVersion === undefined ? undefined : parseVersion(request.sourceVersion);
+    if (source === undefined) {
+      return refuseDestination(
+        "dest_agent_version_unknown",
+        `the source version is ${request.sourceVersion ?? "absent"}, not a major.minor.patch, so ${remote.machine} cannot be compared`,
+      );
+    }
+    if (isOlder(version, source)) {
+      return refuseDestination(
+        "dest_agent_older",
+        `${executable} on ${remote.machine} is ${version.join(".")}, older than the source's ${source.join(".")}`,
+      );
+    }
+    return { ok: true, configDir, version: version.join(".") };
+  }
+
+  async #destinationConfigDir(executable: string, home: string, remote: RemoteRun): Promise<string | DestinationRefusal> {
+    let configDir = `${home}/.claude`;
+    if (executable !== "claude") {
+      const where = await remote.run([executable, "--where"]);
+      const printed = where.stdout.trim();
+      if (where.code !== 0 || !isAbsolute(printed)) {
+        return refuseDestination("dest_profile_missing", `${executable} --where on ${remote.machine} did not print an absolute path`);
+      }
+      configDir = printed;
+    }
+    const exists = await remote.run(["test", "-d", configDir]);
+    if (exists.code !== 0) return refuseDestination("dest_profile_missing", `${configDir} does not exist on ${remote.machine}`);
+    return configDir;
   }
 
   async findSession(terminal: HcTerminal): Promise<SessionResult> {
