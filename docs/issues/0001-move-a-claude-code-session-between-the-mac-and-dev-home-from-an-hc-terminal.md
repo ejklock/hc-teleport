@@ -67,7 +67,13 @@ An `hc-teleport <terminal> <machine>` command moves a Claude Code session that r
 
 ### Open questions
 
-- **Provisioning on the other fronts.** Parity needs work outside this repository: Node and Claude Code roles in dev-fleet, the `claude-pa` and `claude-bd` wrappers in the chezmoi dotfiles, and profiles, MCP servers and hooks from the se-configs installer on Linux. Each needs an issue in its own repository, which the owner opens or authorizes.
+- **Provisioning on the other fronts.** Parity is already planned outside this repository; no new issue is needed there:
+  - dev-fleet issue 0002 (open) has the `node`, `claude` and `se-configs` roles, and the last runs `./install.sh claude` on the box;
+  - se-configs ADR 0041 makes that installer read the `bd`, `klock` and `pa` profiles from `harness/claude/manifest.json`, write the `claude-<name>` launchers into `~/.local/bin`, link the shared setup and register the MCP servers in each profile;
+  - each Linux gap of the installer becomes its own se-configs issue (dev-fleet issue 0002);
+  - the login of each profile is the owner's step.
+
+  The real move in Acceptance waits on dev-fleet issue 0002 running on `dev-home`.
 - **Upstream.** Propose `hc move <t> --to <machine>` to herdr-core once this works.
 
 ### Acceptance
@@ -81,3 +87,17 @@ An `hc-teleport <terminal> <machine>` command moves a Claude Code session that r
   - a destination that does not come up leaves no refs or transcript there, and the source still runs;
   - a move there and back restores the original state.
 - A real move from the Mac to `dev-home` and back resumes the conversation. This is the owner's step, after the provisioning on the other fronts lands.
+
+### Plan
+
+Slices, by behavior. Each is proved through its slice's index or the CLI; S2's test bed runs every later slice's container tests.
+
+- S1: `hc-teleport <t> <machine> --dry-run --json` prints the session plan of a Claude terminal (session id, config dir, transcript paths, resume argv) or refuses with a named reason: terminal not idle, no session id, a flag outside the allowed list | files: package.json, tsconfig.json, .nvmrc, vitest.config.ts, src/app/cli.ts, src/session/index.ts, src/session/claude-adapter.ts, src/session/resume-argv.ts, src/platform/hc.ts, src/platform/process.ts, tests/session/*.test.ts | after: none
+- S2: a test bed of two containers, `source` (plays the Mac) and `dest` (plays `dev-home`), each running `hc` built from herdr-core tag v0.1.19, with git, sshd on `dest`, a fake `claude` and `claude-klock`, and `dest` added as an `hc machine` of `source`; a vitest helper starts and stops it; a smoke test runs `hc exec --on dest` and `git ls-remote` over SSH | files: tests/bed/Dockerfile, tests/bed/compose.yaml, tests/bed/fake-claude, tests/bed/bed.ts, tests/bed/bed.test.ts | after: S1 (it extends S1's package and vitest setup)
+- S3: the read-only preflight on the destination refuses, changing nothing, when the repository, the wrapper, the profile directory is missing, or the destination's Claude Code is older | files: src/preflight/index.ts, src/preflight/preflight.ts, tests/preflight/*.test.ts | after: S2
+- S4: git carry to the destination over SSH: commits, staged, unstaged, untracked and binary changes reach the destination checkout through `refs/hc-teleport/*`, the source checkout, index and branch stay unchanged, and a diverged or dirty destination refuses with nothing written | files: src/git-carry/index.ts, src/git-carry/carry.ts, src/git-carry/snapshot.ts, tests/git-carry/*.test.ts | after: S2
+- S5: transcript carry: the transcript and its subagent directory land under the destination's project directory with the home path rewritten; the rewrite round-trips | files: src/transcript-carry/index.ts, src/transcript-carry/carry.ts, src/transcript-carry/rewrite.ts, tests/transcript-carry/*.test.ts | after: S2
+- S6: the move end to end: resume on the destination with the allowed flags, check it came up, then stop the source and park its changes in `refs/hc-teleport/<id>`; a destination that does not come up is rolled back; every refusal changes nothing on either side (combined-flow test) | files: src/move/index.ts, src/move/move.ts, src/app/cli.ts | after: S3, S4, S5
+- S7: the way back, started from the Mac: `dev-home` to the Mac with git fetched over SSH and the transcript read through `hc file`; a move there and back restores the original state | files: src/move/move.ts, src/git-carry/carry.ts, src/transcript-carry/carry.ts, tests/move/*.test.ts | after: S6
+
+Choices the session made (cheap to change): no dependency beyond `typescript`, `@types/node`, `zod` (every external output is parsed), `vitest` and `fast-check`; subprocesses through `node:child_process` `execFile` with a timeout and a shared `maxBuffer`; arguments through `node:util` `parseArgs`; the test bed driven by the `docker compose` CLI, not testcontainers, to add no dependency; `hc` built from source in the bed because herdr-core publishes tags only (`gh api repos/herdrdev/herdr-core/tags`, no release); a crash mid-move leaves only named `refs/hc-teleport/*` refs, no journal.
