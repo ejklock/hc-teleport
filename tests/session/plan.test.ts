@@ -124,7 +124,7 @@ describe("plans a move from the address and the destination", () => {
       transcript: { file: join(home, ".claude", "projects", PROJECT_DIR, `${SESSION_ID}.jsonl`) },
       resume: { argv: ["claude", "--resume", SESSION_ID] },
     });
-    expect(calls).toEqual(["get t6c --json", "machine ls --json"]);
+    expect(calls).toEqual(["get --json -- t6c", "machine ls --json"]);
   });
 
   it("of a terminal on an hc machine to the Mac, reading the session on that machine", async () => {
@@ -138,7 +138,7 @@ describe("plans a move from the address and the destination", () => {
       transcript: { file: `/home/box/.claude/projects/${PROJECT_DIR}/${SESSION_ID}.jsonl` },
       resume: { argv: ["claude", "--resume", SESSION_ID] },
     });
-    expect(calls).toEqual(["get dev-home/t6c --json", "machine ls --json"]);
+    expect(calls).toEqual(["get --json -- dev-home/t6c", "machine ls --json"]);
   });
 
   it("with the Mac source read from the home it is given, not from the remote machine", async () => {

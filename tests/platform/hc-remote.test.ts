@@ -373,3 +373,13 @@ describe("Hc terminal calls", () => {
     expect((failure as HcError).message).toContain("dest/t99");
   });
 });
+
+describe("Hc get", () => {
+  it.each([["-t1"], ["t7"], ["dev-home/t3"]])("reads a terminal: passes %s after -- with the flags first", async (address) => {
+    const { run, calls } = recording(JSON.stringify({ address, argv: ["claude"], cwd: "/home/box", state: "live" }));
+    const terminal = await new Hc(run).terminal(address);
+    expect(terminal).toMatchObject({ address, argv: ["claude"], cwd: "/home/box", state: "live" });
+    expect(calls[0]?.file).toBe("hc");
+    expect(calls[0]?.args).toEqual(["get", "--json", "--", address]);
+  });
+});

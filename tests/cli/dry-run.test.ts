@@ -111,13 +111,13 @@ beforeEach(async () => {
   await script(
     join(bin, "hc"),
     `[ -f "$FAKE_STATE/hc-fails" ] && { echo "hc exploded" >&2; exit 1; }
-case "$1 $2 $3" in
-  "get t6c --json") cat "$FAKE_STATE/get.json" ;;
-  "machine ls --json") cat "$FAKE_STATE/machines.json" ;;
-  "get "*"/t6c --json") cat "$FAKE_STATE/get.json" ;;
-  "exec --json --on=dev-home") case " $* " in *" -- printenv "*) [ -f "$FAKE_STATE/source-home-fails" ] && { echo "hc cannot reach dev-home" >&2; exit 1; } ;; esac
+case "$1 $2 $3 $4" in
+  "get --json -- t6c") cat "$FAKE_STATE/get.json" ;;
+  "machine ls --json "*) cat "$FAKE_STATE/machines.json" ;;
+  "get --json -- "*"/t6c") cat "$FAKE_STATE/get.json" ;;
+  "exec --json --on=dev-home "*) case " $* " in *" -- printenv "*) [ -f "$FAKE_STATE/source-home-fails" ] && { echo "hc cannot reach dev-home" >&2; exit 1; } ;; esac
     "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
-  "exec --json --"|"file read --json") "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
+  "exec --json -- "*|"file read --json "*) "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac`,
   );

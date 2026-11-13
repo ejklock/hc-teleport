@@ -160,7 +160,10 @@ async function dryRun(terminal: string, machine: string, json: boolean): Promise
 
 function failure(error: unknown, json: boolean): number {
   if (error instanceof HcError || (error instanceof MachineError && error.code === "exec_failed")) return fail({ reason: "hc_failed", detail: error.message }, json, EXIT.failed);
-  // A local program such as git failing before anything was written, for a session folder that is in no work tree.
+  // A program a move runs failing before anything is recorded as written: the preflight's git on the source for a
+  // session folder that is in no work tree; and, in the git carry, git or cp on the source (the Mac or an hc
+  // machine), mktemp or rm only on an hc machine as the source, the Mac's `git push` as the source, its `git fetch`
+  // as the destination, and the update-ref and ref cleanup that fetch runs on the source.
   if (error instanceof ProcessError) return fail({ reason: "command_failed", detail: error.message }, json, EXIT.failed);
   return fail({ reason: "unexpected_error", detail: error instanceof Error ? error.message : String(error) }, json, EXIT.failed);
 }

@@ -125,7 +125,7 @@ export class Hc {
   }
 
   terminal(address: string): Promise<HcTerminal> {
-    return this.#query(["get", address, "--json"], terminalSchema);
+    return this.#query(["get", "--json", "--", address], terminalSchema);
   }
 
   async machines(): Promise<readonly HcMachine[]> {
