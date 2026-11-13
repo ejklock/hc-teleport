@@ -112,6 +112,8 @@ A rolled back move puts the destination back as it was before the move: it ends 
 npm test            # vitest; add a name to filter, e.g. npm test -- resume-argv
 npm run typecheck
 npm run build
+npm run lint        # eslint with the typed config
+npm run coverage    # vitest with coverage into coverage/lcov.info, then the se-gates coverage receipt
 ```
 
 Tests build their own temporary HOME and put a fake `hc` and a fake launcher first on the PATH; they never touch the real `hc` or `~/.claude*`.
