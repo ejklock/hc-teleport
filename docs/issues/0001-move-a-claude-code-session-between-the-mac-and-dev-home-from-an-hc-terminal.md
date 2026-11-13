@@ -40,6 +40,7 @@ An `hc-teleport <terminal> <machine>` command moves a Claude Code session that r
 
 ### Decision
 
+
 - A new repository, `klock-tecnologia/hc-teleport`, outside dev-fleet and se-configs (owner, 2026-11-09).
 - Built on `hc` primitives, because `hc` has no plugin system. Not taken:
   - wrapping hopsesh (alpha; it pulls from the destination, which would need SSH from `dev-home` to the Mac);
@@ -73,6 +74,7 @@ An `hc-teleport <terminal> <machine>` command moves a Claude Code session that r
 - **The Mac is named `local`** (owner, 2026-11-10). `hc-teleport dev-home/t5 local` brings a session back to the Mac; the move refuses when an `hc` machine is itself named `local`. One end of a move is always the Mac; a move between two remote machines refuses. Not taken: a `--here` flag (a second command form); no second argument meaning the Mac (a forgotten argument starts a move).
 - **An unreadable session on the source refuses `session_unreadable`** (owner, 2026-11-10). When the source machine cannot read the session's subagent folder (a permission error, a failed `find` on a remote machine), the plan refuses with exit 3 and reason `session_unreadable` before anything is written. Not taken: reusing `session_registry_unreadable` (names the registry, not the folder); treating the failure as no subagent folder (the move would write the git carry first and fail later in the transcript carry).
 - **The way back reuses the session's ref namespace** (owner, 2026-11-10). A move and its way back share `refs/hc-teleport/<id>/*`: the way back's git carry overwrites the park refs the first move left on its destination, and a way back that rolls back deletes them, so the Mac then holds no park record while the remote checkout still holds the live work. A way back that succeeds brings that work into the checkout, which makes the overwritten record redundant. Not taken: one namespace per move (a new ref format and refs that pile up); copying the park refs aside before the carry (a second record to keep and clean).
+- **Public on GitHub as `ejklock/hc-teleport`, MIT** (owner, 2026-11-13). The repository goes public under `ejklock`, like `herdr-workspaces` and `claude-usage-mod`, so se-configs installs it from its tagged releases. Its license is MIT, the same as `ejklock/herdr-workspaces`. Not taken: `klocktecnologia/hc-teleport` (beside the private se-configs and se-gates); MIT chosen on its own; no license (public, all rights reserved).
 
 ### Open questions
 
