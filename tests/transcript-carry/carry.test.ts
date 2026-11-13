@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Hc, HcExecOptions, HcExecResult } from "../../src/platform/hc.ts";
 import { HcError } from "../../src/platform/hc.ts";
 import { LocalMachine, MachineError, type Entry, type EntryKind, type ExecResult, type Machine } from "../../src/platform/machine.ts";
-import { carryTranscript, TranscriptCarryError, undoTranscriptCarry, type CarryDeps, type CarryRequest } from "../../src/transcript-carry/carry.ts";
+import { carryTranscript, TranscriptCarryError, TranscriptPutBackError, undoTranscriptCarry, type CarryDeps, type CarryRequest, type CarryResult } from "../../src/transcript-carry/carry.ts";
 
 type Call = { argv: string[]; stdin?: string };
 type Behavior = (call: Call) => Partial<HcExecResult> | undefined;
@@ -107,6 +107,51 @@ describe("carryTranscript against an injected runner", () => {
     expect(calls).toEqual([]);
   });
 
+  it("reports the put back when placing the second file fails and moving the first file's kept copy back fails", async () => {
+    const { hc, calls } = fakeHc((call) => {
+      if (isExistenceCheck(call)) return { code: 0 };
+      if (call.argv[0] === "dd" && call.argv[1]?.includes(destAgent)) return { code: 1, stderr: "disk full" };
+      return call.argv[0] === "mv" && call.argv[3]?.endsWith(".prev") ? { code: 1, stderr: "busy" } : undefined;
+    });
+    const failure = await carryTranscript(request, { hc }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const keptAt = calls.find((call) => call.argv[0] === "ln")?.argv[3] ?? "missing";
+    expect(failure).toBeInstanceOf(TranscriptPutBackError);
+    const putBack = failure as TranscriptPutBackError;
+    expect(putBack.cause).toBeInstanceOf(HcError);
+    expect((putBack.cause as Error).message).toMatch(/dd on dest exited 1: disk full/);
+    expect(putBack.left).toHaveLength(1);
+    expect(putBack.left[0]).toContain(destFile);
+    expect(putBack.left[0]).toContain(keptAt);
+  });
+
+  it("rethrows the placing error itself when the put back succeeds", async () => {
+    const { hc } = fakeHc((call) => {
+      if (isExistenceCheck(call)) return { code: 1 };
+      return call.argv[0] === "dd" && call.argv[1]?.includes(destAgent) ? { code: 1, stderr: "disk full" } : undefined;
+    });
+    const failure = await carryTranscript(request, { hc }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(HcError);
+    expect(failure).not.toBeInstanceOf(TranscriptPutBackError);
+  });
+
+  it("attempts no put back when a refusal comes before anything is written", async () => {
+    await writeFile(agent, Buffer.from([0x7b, 0x22, 0xff, 0x7d]));
+    const { hc, calls } = fakeHc();
+    const failure = await carryTranscript(request, { hc }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(TranscriptCarryError);
+    expect(failure).not.toBeInstanceOf(TranscriptPutBackError);
+    expect(calls).toEqual([]);
+  });
+
   it("places each file by a rename from a temporary name next to it", async () => {
     const { hc, calls } = fakeHc((call) => (isExistenceCheck(call) ? { code: 1 } : undefined));
     const result = await carryTranscript(request, { hc });
@@ -144,6 +189,77 @@ describe("carryTranscript against an injected runner", () => {
       await expect(failure).rejects.toThrow(destFile);
       expect(verbs(calls)).not.toContain("mv");
     });
+  });
+});
+
+describe("undoTranscriptCarry against an injected runner", () => {
+  const destConfigDir = "/dest/cfg";
+  const first = join(destConfigDir, "a.jsonl");
+  const second = join(destConfigDir, "b.jsonl");
+  const third = join(destConfigDir, "c.jsonl");
+  const result: CarryResult = {
+    sourceMachine: "local",
+    machine: "dest",
+    destConfigDir,
+    written: [first, second, third],
+    replaced: [
+      { path: first, keptAt: `${first}.teleport-1.prev` },
+      { path: second, keptAt: `${second}.teleport-2.prev` },
+    ],
+    destHomeCount: 0,
+  };
+  const attempt = (deps: CarryDeps) =>
+    undoTranscriptCarry(result, deps).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+  it("undo moves back every replaced file and removes every written file even after a move back fails", async () => {
+    const { hc, calls } = fakeHc((call) => (call.argv[0] === "mv" && call.argv[3] === result.replaced[0]?.keptAt ? { code: 1, stderr: "busy" } : undefined));
+    const failure = await attempt({ hc });
+    expect(failure).toBeInstanceOf(TranscriptPutBackError);
+    const putBack = failure as TranscriptPutBackError;
+    expect(putBack.left).toHaveLength(1);
+    expect(putBack.left[0]).toContain(first);
+    expect(putBack.left[0]).toContain(`${first}.teleport-1.prev`);
+    expect(putBack.cause).toBeInstanceOf(HcError);
+    expect(calls.filter((call) => call.argv[0] !== "test").map((call) => call.argv)).toEqual([
+      ["mv", "-f", "--", `${first}.teleport-1.prev`, first],
+      ["mv", "-f", "--", `${second}.teleport-2.prev`, second],
+      ["rm", "-f", "--", third],
+    ]);
+  });
+
+  it("undo keeps the first failure as the cause when a later removal fails with another message", async () => {
+    const { hc } = fakeHc((call) => {
+      if (call.argv[0] === "mv" && call.argv[3] === result.replaced[0]?.keptAt) return { code: 1, stderr: "busy" };
+      return call.argv[0] === "rm" ? { code: 1, stderr: "read-only" } : undefined;
+    });
+    const failure = await attempt({ hc });
+    expect(failure).toBeInstanceOf(TranscriptPutBackError);
+    const putBack = failure as TranscriptPutBackError;
+    expect((putBack.cause as Error).message).toMatch(/busy/);
+    expect((putBack.cause as Error).message).not.toMatch(/read-only/);
+    expect(putBack.left).toEqual([expect.stringContaining(first), expect.stringContaining(third)]);
+  });
+
+  it("undo lists a written file it could not remove and still finishes the rest", async () => {
+    const { hc, calls } = fakeHc((call) => (call.argv[0] === "rm" ? { code: 1, stderr: "read-only" } : undefined));
+    const failure = await attempt({ hc });
+    expect(failure).toBeInstanceOf(TranscriptPutBackError);
+    expect((failure as TranscriptPutBackError).left).toEqual([expect.stringContaining(third)]);
+    expect(calls.filter((call) => call.argv[0] === "mv")).toHaveLength(2);
+  });
+
+  it("undo skips a kept copy that no longer exists without reporting it", async () => {
+    const { hc, calls } = fakeHc((call) => (isExistenceCheck(call) ? { code: 1 } : undefined));
+    await expect(undoTranscriptCarry(result, { hc })).resolves.toBeUndefined();
+    expect(verbs(calls)).not.toContain("mv");
+  });
+
+  it("undo resolves with nothing thrown when every step succeeds", async () => {
+    const { hc } = fakeHc();
+    await expect(undoTranscriptCarry(result, { hc })).resolves.toBeUndefined();
   });
 });
 
@@ -553,14 +669,17 @@ describe("carryTranscript when hc fails", () => {
     expect(calls.at(-1)?.argv.slice(0, 3)).toEqual(["rm", "-f", "--"]);
   });
 
-  it("rejects HcError from the undo when the put-back throws", async () => {
+  it("rejects from the undo with the HcError as the cause when the put-back throws", async () => {
     const ok = fakeHc((call) => (isExistenceCheck(call) ? { code: 0 } : undefined));
     const result = await carryTranscript(localSourceRequest, { hc: ok.hc });
     const broken = fakeHc((call) => {
       if (call.argv[0] === "mv") throw unreachable();
       return undefined;
     });
-    await rejectsUnreachable(undoTranscriptCarry(result, { hc: broken.hc }));
+    const failure = undoTranscriptCarry(result, { hc: broken.hc });
+    await expect(failure).rejects.toBeInstanceOf(TranscriptPutBackError);
+    await expect(failure).rejects.toMatchObject({ cause: expect.any(HcError) });
+    await expect(failure).rejects.toThrow(/hc exec: machine unreachable/);
   });
 
   /** An hc that answers the calls before the range read the way GNU tools do, then lets `behave` decide wc and od. */

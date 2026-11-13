@@ -5,7 +5,7 @@ import type { Runner } from "../platform/process.ts";
 import type { RemoteRun } from "../session/agent-adapter.ts";
 import { planSession, type SessionPlan } from "../session/index.ts";
 import { preflight } from "../preflight/index.ts";
-import { carryTranscript, TranscriptCarryError, undoTranscriptCarry } from "../transcript-carry/index.ts";
+import { carryTranscript, TranscriptCarryError, TranscriptPutBackError, undoTranscriptCarry } from "../transcript-carry/index.ts";
 
 type Carried = Extract<Awaited<ReturnType<typeof carryGit>>, { status: "carried" | "failed" }>;
 type TranscriptCarried = Awaited<ReturnType<typeof carryTranscript>>;
@@ -220,6 +220,7 @@ async function rollBack(written: Written, cause: unknown, deps: MoveDeps): Promi
     const address = written.address;
     await attempt(`terminal ${address} still runs`, () => deps.hc.kill(address));
   }
+  const transcriptLeftAt = left.length;
   if (written.transcript !== undefined) {
     const transcript = written.transcript;
     await attempt(`transcript files under ${transcript.destConfigDir}: ${transcript.written.join(", ")}`, () =>
@@ -230,7 +231,8 @@ async function rollBack(written: Written, cause: unknown, deps: MoveDeps): Promi
     undoGitCarry(written.git, { hc: deps.hc }),
   );
 
-  const reason = describe(cause);
+  if (cause instanceof TranscriptPutBackError) left.splice(transcriptLeftAt, 0, ...cause.left);
+  const reason = describe(cause instanceof TranscriptPutBackError ? cause.cause : cause);
   if (left.length > 0) return { status: "rollback_failed", cause: `${reason.reason}: ${reason.detail}`, left };
   if (cause instanceof TranscriptCarryError) return { status: "refused", refusal: reason };
   return { status: "rolled_back", ...reason };

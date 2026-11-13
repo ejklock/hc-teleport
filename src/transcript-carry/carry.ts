@@ -28,6 +28,17 @@ export class TranscriptCarryError extends Error {
   }
 }
 
+/** The carry could not put back what it had changed; `left` names each destination path not restored. */
+export class TranscriptPutBackError extends Error {
+  readonly left: readonly string[];
+
+  constructor(left: readonly string[], cause: unknown) {
+    super(`the transcript files could not be put back: ${left.join("; ")}`, { cause });
+    this.name = "TranscriptPutBackError";
+    this.left = left;
+  }
+}
+
 export type CarryRequest = {
   /** The machine that receives the files: `local` for the Mac, else an hc machine. */
   machine: string;
@@ -69,7 +80,9 @@ type Prepared = { destPath: string; chunks: string[] };
  * paths under the destination config directory, with the source home rewritten to the
  * destination home. One end is the Mac (`local`) and the other an hc machine. Each file
  * arrives by rename, so a reader sees the old file or the whole new one; a failure part
- * way puts back what was already placed.
+ * way puts back what was already placed. A put-back that itself fails is reported as a
+ * `TranscriptPutBackError` whose `cause` is the placing error and whose `left` names what
+ * stays on the destination.
  */
 export async function carryTranscript(request: CarryRequest, deps: CarryDeps): Promise<CarryResult> {
   const sourceName = request.sourceMachine ?? LOCAL;
@@ -101,25 +114,48 @@ export async function carryTranscript(request: CarryRequest, deps: CarryDeps): P
   try {
     for (const file of prepared) await place(file, result, deps);
   } catch (error) {
-    await undoTranscriptCarry(result, deps).catch(() => undefined);
+    try {
+      await undoTranscriptCarry(result, deps);
+    } catch (putBack) {
+      if (putBack instanceof TranscriptPutBackError) throw new TranscriptPutBackError(putBack.left, error);
+    }
     throw error;
   }
   return result;
 }
 
-/** Removes the files a carry created and puts back the ones it replaced; running it again does nothing. */
+/**
+ * Removes the files a carry created and puts back the ones it replaced; running it again does nothing.
+ * Every entry is tried even after one fails; the ones left behind come back in a `TranscriptPutBackError`.
+ */
 export async function undoTranscriptCarry(result: CarryResult, deps: CarryDeps): Promise<void> {
   const remote = new Remote(machineFor(result.machine, deps));
   const replacedPaths = new Set(result.replaced.map((entry) => entry.path));
+  const left: string[] = [];
+  let first: unknown;
+  const attempt = async (what: string, step: () => Promise<unknown>): Promise<void> => {
+    try {
+      await step();
+    } catch (error) {
+      first ??= error;
+      left.push(`${what}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
   for (const entry of result.replaced) {
-    assertInside(result.destConfigDir, entry.path);
-    assertInside(result.destConfigDir, entry.keptAt);
-    if (await remote.exists(entry.keptAt)) await remote.run(["mv", "-f", "--", entry.keptAt, entry.path]);
+    await attempt(`${entry.path} not restored, the original stays at ${entry.keptAt}`, async () => {
+      assertInside(result.destConfigDir, entry.path);
+      assertInside(result.destConfigDir, entry.keptAt);
+      if (await remote.exists(entry.keptAt)) await remote.run(["mv", "-f", "--", entry.keptAt, entry.path]);
+    });
   }
   for (const path of result.written) {
-    assertInside(result.destConfigDir, path);
-    if (!replacedPaths.has(path)) await remote.run(["rm", "-f", "--", path]);
+    if (replacedPaths.has(path)) continue;
+    await attempt(`${path} not removed`, async () => {
+      assertInside(result.destConfigDir, path);
+      await remote.run(["rm", "-f", "--", path]);
+    });
   }
+  if (left.length > 0) throw new TranscriptPutBackError(left, first);
 }
 
 function machineFor(name: string, deps: CarryDeps): Machine {

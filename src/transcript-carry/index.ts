@@ -1,1 +1,1 @@
-export { carryTranscript, undoTranscriptCarry, TranscriptCarryError } from "./carry.ts";
+export { carryTranscript, undoTranscriptCarry, TranscriptCarryError, TranscriptPutBackError } from "./carry.ts";

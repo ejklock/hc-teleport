@@ -31,7 +31,7 @@ vi.mock("../../src/transcript-carry/index.ts", async () => {
 });
 
 const { moveSession } = await import("../../src/move/index.ts");
-const { TranscriptCarryError } = await import("../../src/transcript-carry/index.ts");
+const { TranscriptCarryError, TranscriptPutBackError } = await import("../../src/transcript-carry/index.ts");
 
 const SESSION_ID = "09e11b42-f5c1-4c38-99f1-dd1d8b00355c";
 const DEST_ADDRESS = "dev-home/t7";
@@ -402,6 +402,62 @@ describe("rolls back", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("a transcript put back that fails", () => {
+  const stranded = [
+    "/home/box/.claude/projects/p/s.jsonl not restored, the original stays at /home/box/.claude/projects/p/s.jsonl.teleport-1.prev: busy",
+    "/home/box/.claude/projects/p/a.jsonl not removed: read-only",
+  ];
+
+  it("reports rollback_failed naming every path left, with the placing error as the cause, and still undoes git", async () => {
+    mocks.carryTranscript.mockRejectedValue(new TranscriptPutBackError(stranded, new HcError("dd on dev-home exited 1: disk full")));
+
+    const result = await move();
+
+    expect(result).toEqual({
+      status: "rollback_failed",
+      cause: "hc_failed: dd on dev-home exited 1: disk full",
+      left: stranded,
+    });
+    expect(mocks.undoGitCarry).toHaveBeenCalledWith(carried, expect.anything());
+    expect(mocks.undoTranscriptCarry).not.toHaveBeenCalled();
+  });
+
+  it("lists the transcript paths and the refs when the git undo fails too", async () => {
+    mocks.carryTranscript.mockRejectedValue(new TranscriptPutBackError(stranded, new HcError("dd on dev-home exited 1: disk full")));
+    mocks.undoGitCarry.mockRejectedValue(new HcError("git failed"));
+
+    const result = await move();
+
+    expect(result).toMatchObject({
+      status: "rollback_failed",
+      left: [...stranded, expect.stringContaining("refs/hc-teleport/")],
+    });
+  });
+
+  it("still rolls back a plain hc failure of the carry", async () => {
+    mocks.carryTranscript.mockRejectedValue(new HcError("dd on dev-home exited 1: disk full"));
+
+    expect(await move()).toEqual({ status: "rolled_back", reason: "hc_failed", detail: "dd on dev-home exited 1: disk full" });
+  });
+
+  it("still refuses when the carry refuses before writing", async () => {
+    mocks.carryTranscript.mockRejectedValue(new TranscriptCarryError("transcript_missing", "gone"));
+
+    expect(await move()).toMatchObject({ status: "refused", refusal: { reason: "transcript_missing" } });
+  });
+
+  it("names the paths when the undo after a later failure throws a put back error", async () => {
+    waits = [{ kind: "blocked" }];
+    mocks.undoTranscriptCarry.mockRejectedValue(new TranscriptPutBackError(stranded, new HcError("busy")));
+
+    const result = await move();
+
+    expect(result).toMatchObject({ status: "rollback_failed", cause: expect.stringContaining("destination_blocked") });
+    if (result.status !== "rollback_failed") return;
+    expect(result.left).toEqual([expect.stringContaining(stranded[0] ?? "missing")]);
   });
 });
 
