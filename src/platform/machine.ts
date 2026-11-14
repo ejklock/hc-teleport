@@ -261,20 +261,6 @@ function execFailureDetail(failure: z.infer<typeof execFailureSchema> | undefine
   return failure.message;
 }
 
-const hcFailureSchema = z.object({ error: z.object({ kind: z.string(), message: z.string() }) });
-
-/** The `{"error": …}` JSON hc prints on stderr, which `Hc` carries at the end of its error message. */
-function hcFailureKind(error: HcError): string | undefined {
-  const start = error.message.lastIndexOf('{"error"');
-  if (start < 0) return undefined;
-  try {
-    const parsed = hcFailureSchema.safeParse(JSON.parse(error.message.slice(start)));
-    return parsed.success ? parsed.data.error.kind : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 const HC_FILE_CODES: Readonly<Record<string, MachineErrorCode>> = { not_found: "ENOENT", not_text: "not_text" };
 
 /** `find -printf` of depth, type and path relative to the start, each ended by NUL, so a name may hold any character but NUL. */
@@ -403,7 +389,7 @@ export class HcMachine implements Machine {
 
   #fileFailure(error: unknown, detail: string): unknown {
     if (!(error instanceof HcError)) return error;
-    const code = HC_FILE_CODES[hcFailureKind(error) ?? ""] ?? "failed";
+    const code = HC_FILE_CODES[error.kind ?? ""] ?? "failed";
     return new MachineError(this.name, code, `${detail}: ${error.message}`);
   }
 }

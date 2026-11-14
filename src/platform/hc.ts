@@ -39,6 +39,8 @@ const machineSchema = z
 
 const machinesSchema = z.object({ machines: z.array(machineSchema) });
 
+const serverStatusSchema = z.object({ core: z.object({ name: z.string().min(1) }) });
+
 const execSchema = z.object({
   code: z.number().int().nullable(),
   signal: z.number().int().nullish(),
@@ -110,10 +112,28 @@ export type HcWaitOutcome =
 export type HcTerminal = z.infer<typeof terminalSchema>;
 export type HcMachine = z.infer<typeof machinesSchema>["machines"][number];
 
+const hcFailureSchema = z.object({ error: z.object({ kind: z.string() }) });
+
+/** The kind in the `{"error": …}` JSON hc prints on stderr, which ends the message of a failed call. */
+function readHcKind(message: string): string | undefined {
+  const start = message.lastIndexOf('{"error"');
+  if (start < 0) return undefined;
+  try {
+    const parsed = hcFailureSchema.safeParse(JSON.parse(message.slice(start)));
+    return parsed.success ? parsed.data.error.kind : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class HcError extends Error {
+  /** The error kind hc printed, such as `spawn_failed`; absent when hc printed none or the wrapper raised the error. */
+  readonly kind: string | undefined;
+
   constructor(detail: string) {
     super(detail);
     this.name = "HcError";
+    this.kind = readHcKind(detail);
   }
 }
 
@@ -132,6 +152,12 @@ export class Hc {
   async machines(): Promise<readonly HcMachine[]> {
     const reply = await this.#query(["machine", "ls", "--json"], machinesSchema);
     return reply.machines;
+  }
+
+  /** The name the core calls itself, which `local` stands for in a config. */
+  async serverStatus(): Promise<string> {
+    const reply = await this.#query(["server", "status", "--json"], serverStatusSchema);
+    return reply.core.name;
   }
 
   /** Runs a program through `hc exec`, with no shell; output comes back as text. */

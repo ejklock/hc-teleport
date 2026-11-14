@@ -1,9 +1,17 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MoveOutcome } from "../../src/move/index.ts";
+import type * as HcModule from "../../src/platform/hc.ts";
 import type { SessionPlan } from "../../src/session/index.ts";
 
 const moveSession = vi.hoisted(() => vi.fn());
 vi.mock("../../src/move/index.ts", () => ({ moveSession }));
+vi.mock("../../src/platform/hc.ts", async (importOriginal) => {
+  const original = await importOriginal<typeof HcModule>();
+  return { ...original, Hc: class extends original.Hc { override serverStatus = () => Promise.resolve("mac-core"); } };
+});
 
 const SESSION_ID = "09e11b42-f5c1-4c38-99f1-dd1d8b00355c";
 
@@ -37,12 +45,23 @@ async function cli(...args: string[]): Promise<Run> {
   return { code, stdout: out.join(""), stderr: err.join("") };
 }
 
-beforeEach(() => {
+let configHome: string;
+let previousXdg: string | undefined;
+
+beforeEach(async () => {
   moveSession.mockReset();
+  configHome = await mkdtemp(join(tmpdir(), "move-config-"));
+  await mkdir(join(configHome, "hc-teleport"));
+  await writeFile(join(configHome, "hc-teleport", "config.json"), JSON.stringify({ v: 1, allowed: ["local", "dev-home"] }));
+  previousXdg = process.env["XDG_CONFIG_HOME"];
+  process.env["XDG_CONFIG_HOME"] = configHome;
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
+  if (previousXdg === undefined) delete process.env["XDG_CONFIG_HOME"];
+  else process.env["XDG_CONFIG_HOME"] = previousXdg;
+  await rm(configHome, { recursive: true, force: true });
 });
 
 const outcomes = (outcome: MoveOutcome) => moveSession.mockResolvedValue(outcome);

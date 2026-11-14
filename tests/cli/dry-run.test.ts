@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Hc, HcError, type HcTerminal } from "../../src/platform/hc.ts";
 import { processRunner } from "../../src/platform/process.ts";
@@ -53,6 +53,7 @@ let bin: string;
 let state: string;
 let terminal: HcTerminal;
 let registryCwd: string | undefined;
+let extraEnv: Record<string, string> = {};
 
 async function fixture(name: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(join(ROOT, "tests", "fixtures", name), "utf8"));
@@ -87,8 +88,21 @@ async function registry(configDir: string, cwd = terminal.cwd): Promise<void> {
   await writeFile(join(configDir, "sessions", `${pid}.json`), JSON.stringify({ pid, sessionId: SESSION_ID, cwd, version: "2.1.321" }));
 }
 
+function configFile(base = join(home, ".config")): string {
+  return join(base, "hc-teleport", "config.json");
+}
+
+async function configure(allowed: readonly string[], base?: string): Promise<void> {
+  await mkdir(dirname(configFile(base)), { recursive: true });
+  await writeFile(configFile(base), JSON.stringify({ v: 1, allowed }));
+}
+
+async function coreNamed(name: string): Promise<void> {
+  await writeFile(join(state, "server.json"), JSON.stringify({ core: { id: "8d4a003f50c1efe47c29866c4ead22be", name }, version: "0.1.21" }));
+}
+
 function cli(...args: string[]): Promise<Run> {
-  const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, FAKE_STATE: state };
+  const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home, FAKE_STATE: state, ...extraEnv };
   return new Promise((resolve) => {
     execFile(process.execPath, [CLI, ...args], { env }, (error, stdout, stderr) => {
       const code = error === null ? 0 : typeof error.code === "number" ? error.code : -1;
@@ -103,6 +117,7 @@ async function tree(dir: string): Promise<string[]> {
 
 beforeEach(async () => {
   registryCwd = undefined;
+  extraEnv = {};
   scratch = await mkdtemp(join(tmpdir(), "dry-run-"));
   home = join(scratch, "home");
   bin = join(scratch, "bin");
@@ -110,14 +125,16 @@ beforeEach(async () => {
   await Promise.all([mkdir(home), mkdir(bin), mkdir(state)]);
   await script(
     join(bin, "hc"),
-    `[ -f "$FAKE_STATE/hc-fails" ] && { echo "hc exploded" >&2; exit 1; }
+    `echo "$*" >> "$FAKE_STATE/hc-calls"
+[ "$1 $2" = "server status" ] && { [ -f "$FAKE_STATE/server-fails" ] && { echo "hc server down" >&2; exit 1; }; cat "$FAKE_STATE/server.json"; exit 0; }
+[ -f "$FAKE_STATE/hc-fails" ] && { echo "hc exploded" >&2; exit 1; }
 case "$1 $2 $3 $4" in
   "get --json -- t6c") cat "$FAKE_STATE/get.json" ;;
   "machine ls --json "*) cat "$FAKE_STATE/machines.json" ;;
   "get --json -- "*"/t6c") cat "$FAKE_STATE/get.json" ;;
   "exec --json --on=dev-home "*) case " $* " in *" -- printenv "*) [ -f "$FAKE_STATE/source-home-fails" ] && { echo "hc cannot reach dev-home" >&2; exit 1; } ;; esac
     "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
-  "exec --json -- "*|"file read --json "*) "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
+  "exec --json -- "*|"exec --json --timeout "*|"file read --json "*) "${process.execPath}" "${join(bin, "remote.mjs")}" "$@" ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac`,
   );
@@ -130,6 +147,8 @@ esac`,
   await withStatus({ app: "claude-code", state: "done" });
   await publishTerminal();
   await writeFile(join(state, "machines.json"), JSON.stringify(await fixture("hc-machine-ls.json")));
+  await coreNamed("mac-core");
+  await configure(["local", "dev-home", "base-digital", "nowhere", "abby-stg"]);
 });
 
 afterEach(async () => {
@@ -541,5 +560,208 @@ describe("refuses a terminal or an invocation", () => {
     expect(run.code).toBe(2);
     expect(run.stdout).toBe("");
     expect(run.stderr).toContain("usage:");
+  });
+});
+
+describe("requires the config for a move and a dry-run", () => {
+  async function noConfig(): Promise<void> {
+    await rm(join(home, ".config"), { recursive: true, force: true });
+  }
+
+  it.each([["--dry-run"], []])("refuses not_initialized naming init and the path (flags %j)", async (...flags) => {
+    await noConfig();
+    await registry(join(home, ".claude-klock"));
+
+    const json = await cli("t6c", "dev-home", ...flags, "--json");
+    const text = await cli("t6c", "dev-home", ...flags);
+
+    expect(json.code).toBe(3);
+    expect(JSON.parse(json.stdout)).toEqual({ refused: { reason: "not_initialized", detail: expect.stringContaining("hc-teleport init") } });
+    expect(JSON.parse(json.stdout).refused.detail).toContain(configFile());
+    expect(text.code).toBe(3);
+    expect(text.stdout).toBe("");
+    expect(text.stderr).toContain("not_initialized");
+  });
+
+  it("asks no hc question before it refuses", async () => {
+    await noConfig();
+
+    const run = await cli("t6c", "dev-home", "--dry-run", "--json");
+
+    expect(JSON.parse(run.stdout)).toEqual({ refused: { reason: "not_initialized", detail: expect.any(String) } });
+    expect(await readFile(join(state, "hc-calls"), "utf8").catch(() => "")).toBe("");
+  });
+
+  it("refuses config_unreadable naming the path when the file is not JSON", async () => {
+    await writeFile(configFile(), "{nope");
+
+    const run = await cli("t6c", "dev-home", "--dry-run", "--json");
+
+    expect(run.code).toBe(3);
+    expect(JSON.parse(run.stdout)).toEqual({ refused: { reason: "config_unreadable", detail: expect.stringContaining(configFile()) } });
+  });
+
+  it.each([
+    ["version 2", '{"v":2,"allowed":["local"]}'],
+    ["allowed not an array", '{"v":1,"allowed":"local"}'],
+    ["an empty entry", '{"v":1,"allowed":["local",""]}'],
+    ["a non-string entry", '{"v":1,"allowed":[7]}'],
+  ])("refuses config_unreadable for %s", async (_title, text) => {
+    await writeFile(configFile(), text);
+
+    const run = await cli("t6c", "dev-home", "--dry-run", "--json");
+
+    expect(run.code).toBe(3);
+    expect(JSON.parse(run.stdout).refused.reason).toBe("config_unreadable");
+  });
+
+  it("reads the config from an absolute XDG_CONFIG_HOME, not from HOME", async () => {
+    await noConfig();
+    const xdg = join(scratch, "xdg");
+    await configure(["local", "dev-home"], xdg);
+    await registry(join(home, ".claude-klock"));
+    extraEnv = { XDG_CONFIG_HOME: xdg };
+
+    const run = await cli("t6c", "dev-home", "--dry-run", "--json");
+
+    expect(run.code).toBe(0);
+    expect((JSON.parse(run.stdout) as { machine: string }).machine).toBe("dev-home");
+  });
+
+  it.each([["relative/xdg"], [""]])("reads $HOME/.config when XDG_CONFIG_HOME is %j", async (xdg) => {
+    await registry(join(home, ".claude-klock"));
+    extraEnv = { XDG_CONFIG_HOME: xdg };
+
+    const run = await cli("t6c", "dev-home", "--dry-run", "--json");
+
+    expect(run.code).toBe(0);
+  });
+});
+
+describe("allows only configured destinations", () => {
+  const plan = (...args: string[]) => cli(...args, "--dry-run", "--json");
+
+  beforeEach(async () => {
+    await configure(["local", "base-digital"]);
+    await registry(join(home, ".claude-klock"));
+  });
+
+  it("plans a configured hc machine", async () => {
+    const run = await plan("t6c", "base-digital");
+
+    expect(run.code).toBe(0);
+    expect((JSON.parse(run.stdout) as { machine: string }).machine).toBe("base-digital");
+  });
+
+  it.each([["--dry-run"], []])("refuses a machine outside the config, naming it and the config path (flags %j)", async (...flags) => {
+    const run = await cli("t6c", "planet-argon", ...flags, "--json");
+
+    expect(run.code).toBe(3);
+    expect(JSON.parse(run.stdout)).toEqual({ refused: { reason: "machine_not_allowed", detail: expect.stringContaining("planet-argon") } });
+    expect(JSON.parse(run.stdout).refused.detail).toContain(configFile());
+  });
+
+  it("plans local", async () => {
+    const run = await plan("dev-home/t6c", "local");
+
+    expect(run.code).toBe(0);
+    expect((JSON.parse(run.stdout) as { machine: string }).machine).toBe("local");
+  });
+
+  it("takes the core's name to mean local", async () => {
+    await coreNamed("box");
+
+    const run = await plan("dev-home/t6c", "box");
+
+    expect(run.code).toBe(0);
+    expect((JSON.parse(run.stdout) as { machine: string }).machine).toBe("local");
+  });
+
+  it("refuses the core's name when local is not allowed", async () => {
+    await coreNamed("box");
+    await configure(["base-digital"]);
+
+    const run = await plan("dev-home/t6c", "box");
+
+    expect(run.code).toBe(3);
+    expect(JSON.parse(run.stdout).refused).toEqual({ reason: "machine_not_allowed", detail: expect.stringContaining("box") });
+  });
+
+  it("keeps an hc machine named like the core as that machine, not local", async () => {
+    await coreNamed("dev-home");
+    await configure(["dev-home"]);
+
+    const allowed = await plan("t6c", "dev-home");
+    await configure(["local"]);
+    const refused = await plan("t6c", "dev-home");
+
+    expect((JSON.parse(allowed.stdout) as { machine: string }).machine).toBe("dev-home");
+    expect(JSON.parse(refused.stdout).refused.reason).toBe("machine_not_allowed");
+  });
+
+  it("reports hc server status failing as hc_failed with exit 1", async () => {
+    await writeFile(join(state, "server-fails"), "");
+
+    const run = await plan("t6c", "base-digital");
+
+    expect(run.code).toBe(1);
+    expect(JSON.parse(run.stdout)).toEqual({ error: { reason: "hc_failed", detail: expect.stringContaining("hc server down") } });
+  });
+});
+
+describe("init wizard from the command line", () => {
+  it("refuses not_interactive without a terminal and writes nothing", async () => {
+    await rm(join(home, ".config"), { recursive: true, force: true });
+    const before = await tree(home);
+
+    const json = await cli("init", "--json");
+    const text = await cli("init");
+
+    expect(json.code).toBe(3);
+    expect(JSON.parse(json.stdout)).toEqual({ refused: { reason: "not_interactive", detail: expect.any(String) } });
+    expect(text.code).toBe(3);
+    expect(text.stderr).toContain("not_interactive");
+    expect(await tree(home)).toEqual(before);
+  });
+});
+
+describe("doctor from the command line", () => {
+  it("refuses not_initialized without a config and exits 3", async () => {
+    await rm(join(home, ".config"), { recursive: true, force: true });
+
+    const run = await cli("doctor", "--json");
+
+    expect(run.code).toBe(3);
+    expect(JSON.parse(run.stdout).refused.reason).toBe("not_initialized");
+  });
+
+  it("prints one JSON line per allowed machine and exits 0 when all are ok", async () => {
+    await script(join(bin, "claude"), 'echo "2.1.321 (Claude Code)"');
+    await configure(["local"]);
+
+    const run = await cli("doctor", "--json");
+
+    expect(run.code).toBe(0);
+    expect(JSON.parse(run.stdout)).toEqual({ machines: [{ name: "local", status: "ok", detail: "2.1.321 (Claude Code)" }] });
+  });
+
+  it("exits 1 and names a machine hc no longer lists", async () => {
+    await configure(["gone-box"]);
+
+    const run = await cli("doctor");
+
+    expect(run.code).toBe(1);
+    expect(run.stdout).toContain("gone-box");
+    expect(run.stdout).toContain("not in hc machine ls");
+  });
+
+  it("reports an hc failure as hc_failed with exit 1", async () => {
+    await configure(["base-digital"]);
+    await writeFile(join(state, "hc-fails"), "");
+
+    const run = await cli("doctor", "--json");
+
+    expect(run.code).toBe(1);
+    expect(JSON.parse(run.stdout).error.reason).toBe("hc_failed");
   });
 });

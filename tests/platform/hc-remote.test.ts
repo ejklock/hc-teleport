@@ -391,3 +391,65 @@ describe("Hc get", () => {
     expect((await new Hc(bare.run).terminal("t7")).labels).toBeUndefined();
   });
 });
+
+describe("Hc serverStatus reads the core name", () => {
+  const reply = JSON.stringify({ core: { id: "8d4a003f50c1efe47c29866c4ead22be", name: "dev-home" }, uptime_s: 12, version: "0.1.21" });
+
+  it("from the core of hc server status", async () => {
+    const { run, calls } = recording(reply);
+
+    expect(await new Hc(run).serverStatus()).toBe("dev-home");
+    expect(calls[0]?.args).toEqual(["server", "status", "--json"]);
+  });
+
+  it.each([
+    ["no core name", JSON.stringify({ core: { id: "8d4a" }, version: "0.1.21" })],
+    ["no core", JSON.stringify({ version: "0.1.21" })],
+    ["an empty core name", JSON.stringify({ core: { name: "" } })],
+  ])("fails on a reply with %s, naming the command", async (_title, bad) => {
+    const failure = await new Hc(recording(bad).run).serverStatus().catch((e: unknown) => e);
+
+    expect(failure).toBeInstanceOf(HcError);
+    expect((failure as HcError).message).toContain("hc server status --json");
+  });
+
+  it("fails when hc exits non-zero", async () => {
+    const { run } = recording(new ProcessError("hc server status --json", "no server"));
+
+    await expect(new Hc(run).serverStatus()).rejects.toBeInstanceOf(HcError);
+  });
+});
+
+describe("keeps the kind of an hc error", () => {
+  const spawnFailed = '{"error":{"hint":"","kind":"spawn_failed","message":"cannot start hct-no-such-program-xyz: No such file or directory (os error 2)"}}';
+
+  async function failure(stderr: string): Promise<HcError> {
+    const { run } = recording(new ProcessError("hc exec --json --timeout 5 -- hct-no-such-program-xyz --version", stderr));
+    const error = await new Hc(run).exec(["hct-no-such-program-xyz", "--version"], { timeout: 5 }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(HcError);
+    return error as HcError;
+  }
+
+  it("exposes the kind of a reply on stderr and keeps the message", async () => {
+    const error = await failure(spawnFailed);
+
+    expect(error.kind).toBe("spawn_failed");
+    expect(error.message).toContain("cannot start hct-no-such-program-xyz");
+  });
+
+  it("has no kind when the reply names none", async () => {
+    expect((await failure('{"error":{"message":"boom"}}')).kind).toBeUndefined();
+  });
+
+  it("has no kind when the output is not JSON", async () => {
+    expect((await failure("hc: something broke")).kind).toBeUndefined();
+  });
+
+  it("has no kind when the wrapper raised the error itself", async () => {
+    const { run } = recording(execReply({ truncated: true }));
+    const error = await new Hc(run).exec(["x"]).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(HcError);
+    expect((error as HcError).kind).toBeUndefined();
+  });
+});

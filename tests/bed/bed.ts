@@ -221,6 +221,7 @@ export class Bed {
       await bed.step(["build", "source"], BUILD_TIMEOUT_MS);
       await bed.up();
       await bed.connect();
+      await bed.allowDestinations(["dest", "local"]);
     } catch (error) {
       const teardown = await bed.tearDownAfterFailure();
       if (teardown.length === 0) throw error;
@@ -379,6 +380,21 @@ export class Bed {
     });
     if (unhealthy.length > 0)
       throw new BedError(command.join(" "), unhealthy.join("; "));
+  }
+
+  /** Writes the config the CLI on the source side reads before it moves a session. */
+  private async allowDestinations(allowed: readonly string[]): Promise<void> {
+    const write = await this.run(
+      "source",
+      [
+        "sh",
+        "-c",
+        'mkdir -p "$HOME/.config/hc-teleport" && cat > "$HOME/.config/hc-teleport/config.json"',
+      ],
+      { stdin: JSON.stringify({ v: 1, allowed }) },
+    );
+    if (write.code !== 0)
+      throw new BedError("write the hc-teleport config", write.stderr);
   }
 
   private async connect(): Promise<void> {

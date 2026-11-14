@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { homedir } from "node:os";
+import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
+import { configPath, loadConfig, nodeConfigFs, type Config } from "../config/config.ts";
+import { InputEnded, LOCAL, renderDoctor, runDoctor, runInit } from "./init.ts";
 import { Hc, HcError } from "../platform/hc.ts";
 import { moveSession, type MoveOutcome } from "../move/index.ts";
 import { MachineError } from "../platform/machine.ts";
@@ -9,7 +12,13 @@ import { planSession, type SessionPlan } from "../session/index.ts";
 
 const EXIT = { ok: 0, failed: 1, usage: 2, refused: 3, rolledBack: 4 } as const;
 
-const USAGE = "usage: hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]\n  <terminal> is tN on the Mac or <machine>/tN on an hc machine; <machine> is an hc machine, or local for the Mac";
+const USAGE = [
+  "usage: hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]",
+  "       hc-teleport init",
+  "       hc-teleport doctor [--json]",
+  "  <terminal> is tN on the Mac or <machine>/tN on an hc machine; <machine> is an hc machine, or local for the Mac",
+  "  init asks which machines may receive a session and stores the answer; doctor checks those machines",
+].join("\n");
 
 const DEFAULT_TIMEOUT_S = 120;
 const MIN_TIMEOUT_S = 1;
@@ -128,37 +137,113 @@ async function main(args: readonly string[]): Promise<number> {
   } catch (error) {
     return usageError(error instanceof Error ? error.message : String(error));
   }
-  const [terminal, machine, ...extra] = parsed.positionals;
-  if (terminal === undefined || machine === undefined || extra.length > 0) {
-    return usageError("expected exactly <terminal> and <machine>");
-  }
-  const timeoutSeconds = parseTimeout(parsed.values.timeout);
-  if (timeoutSeconds === undefined) {
-    return usageError(`--timeout takes a whole number of seconds from ${MIN_TIMEOUT_S} to ${MAX_TIMEOUT_S}`);
-  }
   const json = parsed.values.json === true;
-
   try {
-    return parsed.values["dry-run"] === true
-      ? await dryRun(terminal, machine, json)
-      : await move({ terminal, machine, timeoutSeconds }, json);
+    return await dispatch(parsed.positionals, { dryRun: parsed.values["dry-run"] === true, timeout: parsed.values.timeout, json });
   } catch (error) {
     return failure(error, json);
   }
 }
 
-async function move(request: { terminal: string; machine: string; timeoutSeconds: number }, json: boolean): Promise<number> {
-  return report(await moveSession(request, { hc: new Hc(), run: processRunner(), home: homedir() }), json);
+async function dispatch(
+  positionals: readonly string[],
+  flags: { dryRun: boolean; timeout: string | undefined; json: boolean },
+): Promise<number> {
+  const [terminal, machine, ...extra] = positionals;
+  if (terminal === "init" && machine === undefined) return init(flags.json);
+  if (terminal === "doctor" && machine === undefined) return doctor(flags.json);
+  if (terminal === undefined || machine === undefined || extra.length > 0) {
+    return usageError("expected exactly <terminal> and <machine>");
+  }
+  const timeoutSeconds = parseTimeout(flags.timeout);
+  if (timeoutSeconds === undefined) {
+    return usageError(`--timeout takes a whole number of seconds from ${MIN_TIMEOUT_S} to ${MAX_TIMEOUT_S}`);
+  }
+  return teleport({ terminal, machine, timeoutSeconds, dryRun: flags.dryRun, json: flags.json });
 }
 
-async function dryRun(terminal: string, machine: string, json: boolean): Promise<number> {
-  const result = await planSession({ terminal, machine }, { hc: new Hc(), home: homedir() });
+type TeleportRequest = { terminal: string; machine: string; timeoutSeconds: number; dryRun: boolean; json: boolean };
+
+async function teleport({ terminal, machine, timeoutSeconds, dryRun, json }: TeleportRequest): Promise<number> {
+  const hc = new Hc();
+  const gated = await gate(machine, hc);
+  if (!gated.ok) return refuse(gated.refusal, json);
+  const request = { terminal, machine: gated.machine };
+  if (dryRun) return showPlan(request, hc, json);
+  return report(await moveSession({ ...request, timeoutSeconds }, { hc, run: processRunner(), home: homedir() }), json);
+}
+
+type Gated = { ok: true; machine: string } | { ok: false; refusal: Reason };
+type ConfigGate = { ok: true; config: Config; path: string } | { ok: false; refusal: Reason };
+
+async function requireConfig(): Promise<ConfigGate> {
+  const path = configPath(process.env, homedir());
+  const loaded = await loadConfig(path);
+  switch (loaded.kind) {
+    case "ok":
+      return { ok: true, config: loaded.config, path };
+    case "missing":
+      return { ok: false, refusal: { reason: "not_initialized", detail: `there is no config at ${path}; run hc-teleport init to choose the machines that may receive a session` } };
+    case "unreadable":
+      return { ok: false, refusal: { reason: "config_unreadable", detail: `${path} cannot be used: ${loaded.detail}; fix it or run hc-teleport init to write it again` } };
+  }
+}
+
+/** The machine the move goes to, once the config allows it; the core's own name means `local` unless hc lists a machine of that name. */
+async function gate(machine: string, hc: Hc): Promise<Gated> {
+  const required = await requireConfig();
+  if (!required.ok) return required;
+  const destination = await resolveDestination(machine, hc);
+  if (required.config.allowed.includes(destination)) return { ok: true, machine: destination };
+  return { ok: false, refusal: { reason: "machine_not_allowed", detail: `${machine} is not allowed to receive a session in ${required.path}; run hc-teleport init to allow it` } };
+}
+
+async function resolveDestination(machine: string, hc: Hc): Promise<string> {
+  if (machine === LOCAL || machine !== (await hc.serverStatus())) return machine;
+  return (await hc.machines()).some(({ name }) => name === machine) ? machine : LOCAL;
+}
+
+async function init(json: boolean): Promise<number> {
+  if (!process.stdin.isTTY) {
+    return refuse({ reason: "not_interactive", detail: "init asks questions and needs a terminal on stdin" }, json);
+  }
+  const lines = createInterface({ input: process.stdin, output: process.stdout });
+  const closed = new Promise<never>((_resolve, reject) => lines.once("close", () => {
+    reject(new InputEnded());
+  }));
+  closed.catch(() => undefined);
+  try {
+    await runInit({
+      hc: new Hc(),
+      ask: (question) => Promise.race([lines.question(question), closed]),
+      out: (line) => process.stdout.write(`${line}\n`),
+      path: configPath(process.env, homedir()),
+      fs: nodeConfigFs,
+    });
+    return EXIT.ok;
+  } finally {
+    lines.close();
+  }
+}
+
+async function doctor(json: boolean): Promise<number> {
+  const required = await requireConfig();
+  if (!required.ok) return refuse(required.refusal, json);
+  const lines = await runDoctor({ hc: new Hc(), config: required.config });
+  const { text, exit } = renderDoctor(lines);
+  process.stdout.write(json ? `${JSON.stringify({ machines: lines })}\n` : `${text === "" ? "no machine is allowed to receive a session; run hc-teleport init" : text}\n`);
+  return exit;
+}
+
+async function showPlan(request: { terminal: string; machine: string }, hc: Hc, json: boolean): Promise<number> {
+  const result = await planSession(request, { hc, home: homedir() });
   if (!result.ok) return refuse(result.refusal, json);
   process.stdout.write(json ? `${JSON.stringify(jsonPlan(result.plan))}\n` : `${renderPlan(result.plan)}\n`);
   return EXIT.ok;
 }
 
 function failure(error: unknown, json: boolean): number {
+  if (error instanceof InputEnded) return fail({ reason: "input_ended", detail: error.message }, json, EXIT.failed);
   if (error instanceof HcError || (error instanceof MachineError && error.code === "exec_failed")) return fail({ reason: "hc_failed", detail: error.message }, json, EXIT.failed);
   // A program a move runs failing before anything is recorded as written: the preflight's git on the source for a
   // session folder that is in no work tree; and, in the git carry, git or cp on the source (the Mac or an hc

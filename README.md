@@ -8,7 +8,23 @@ Moves a coding-agent session that runs in a herdr-core (`hc`) terminal from the 
 
 ```
 hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]
+hc-teleport init
+hc-teleport doctor [--json]
 ```
+
+## Setup: `init` and `doctor`
+
+A move, and a `--dry-run`, need a config that names the machines allowed to receive a session. `hc-teleport init` writes it: an interactive wizard that asks one y/N question for the core's own machine (shown by the name `hc server status` reports, stored as `local`), then one for each machine of `hc machine ls`, in that order. On a rerun the current answers are the defaults, so Enter keeps them; any other answer than y, yes, n, no or Enter asks again. Answering no to every question writes an empty list, and nothing may then receive a session. `init` stores decisions only and needs a terminal on stdin: without one it refuses `not_interactive` and writes nothing.
+
+The config is `$XDG_CONFIG_HOME/hc-teleport/config.json` when `XDG_CONFIG_HOME` is an absolute path, else `$HOME/.config/hc-teleport/config.json`. It is written through a temporary file and a rename, and looks like this:
+
+```json
+{ "v": 1, "allowed": ["local", "base-digital"] }
+```
+
+`hc-teleport doctor` prints one line per allowed machine and writes nothing: `ok` with the Claude Code version when `hc` reaches the machine and `claude --version` runs there, `unreachable` with the reason when `hc exec` fails, `claude missing` when `claude --version` exits non-zero, and `not in hc machine ls` for a config machine `hc` no longer lists. `local` is checked on the core's machine, without `--on`. It exits 0 when every line is ok, else 1, and 3 (`not_initialized`) without a config. With `--json` it prints `{"machines":[{"name":"...","status":"...","detail":"..."}]}`.
+
+`<machine>` in a move is checked against the config: a name equal to the core's name means `local`, unless `hc machine ls` lists a machine of that name.
 
 `--timeout` is how long the move waits for the resumed session to be idle on the destination: a whole number of seconds from 1 to 600, 120 by default. Run it on the Mac. `<terminal>` is an `hc` terminal address: `t6c` for a terminal on the Mac, `dev-home/t6c` for one on the `hc` machine `dev-home`. `<machine>` is the destination: a name from `hc machine ls`, or `local` for the Mac, which `hc machine ls` never lists. A move has the Mac at exactly one end, so `hc-teleport dev-home/t6c local` is the way back: it reads the session on `dev-home` through `hc`, carries git and the transcript to the Mac, resumes the session in a new terminal on the Mac, then stops the terminal on `dev-home` and parks its checkout there; with `--dry-run` it only plans that. It needs Node 26 (`.nvmrc`) and `hc` on the PATH.
 
@@ -55,15 +71,19 @@ A refusal prints `{"refused":{"reason":"...","detail":"..."}}` on stdout under `
 | Code | Meaning |
 |---|---|
 | 0 | The session was moved (or, with `--dry-run`, the plan was printed). A source checkout that could not be parked still exits 0. |
-| 1 | `hc` failed, timed out or printed output that is not the expected JSON (`hc_failed`); a local program failed before anything was written (`command_failed`); an unexpected error before anything was written (`unexpected_error`); the rollback itself failed and the error names what is left on the destination (`rollback_failed`); or the destination is confirmed but the source terminal could not be stopped, so both run and nothing is rolled back (`source_running`). |
+| 1 | `doctor` found a machine that is not ok; `hc` failed, timed out or printed output that is not the expected JSON (`hc_failed`); a local program failed before anything was written (`command_failed`); an unexpected error before anything was written (`unexpected_error`); the rollback itself failed and the error names what is left on the destination (`rollback_failed`); the destination is confirmed but the source terminal could not be stopped, so both run and nothing is rolled back (`source_running`); or the input ended before every `init` question was answered, and the config is unchanged (`input_ended`). |
 | 2 | Wrong invocation: missing or extra arguments, an unknown option, or a `--timeout` that is not a whole number from 1 to 600. |
-| 3 | Refused, nothing changed on either side. |
+| 3 | Refused, nothing changed on either side (also `doctor` without a config, and `init` without a terminal). |
 | 4 | Rolled back: the destination did not come up, or a step after the first write failed. The destination is as before and the source was not touched. |
 
 ## Refusal reasons (exit 3)
 
 | Reason | When |
 |---|---|
+| `not_initialized` | There is no config file; the detail names `hc-teleport init` and the path. |
+| `config_unreadable` | The config is not JSON, has a `v` other than 1, or has an `allowed` that is not a list of non-empty strings; the detail names the path. |
+| `machine_not_allowed` | The destination (after the core's name is read as `local`) is not in the config's `allowed` list. |
+| `not_interactive` | `hc-teleport init` ran with stdin not a terminal. |
 | `terminal_not_running` | The terminal is not live or has exited, or the address is not `tN` or `<machine>/tN`. |
 | `not_idle` | The terminal's status state is not `done` or `idle`, or it has no status. |
 | `unknown_machine` | The source or the destination machine is not in `hc machine ls`. |
