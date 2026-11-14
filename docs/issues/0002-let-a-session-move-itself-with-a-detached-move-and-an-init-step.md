@@ -26,6 +26,7 @@ A session cannot move itself. `/teleport <machine>` typed into a coding-agent se
 
 
 
+
 - **Plugins call the CLI; no MCP server** (owner, 2026-11-14). A slash command and a skill per harness run `hc-teleport`, with `--json` as the contract. Not taken: an MCP server (an extra process per profile that runs inside the session it would stop, and a second contract); the CLI alone (the agent would not know the tool exists).
 - **The detached mode lets a session move itself** (owner, 2026-11-14). Done when `/teleport <machine>` inside a session makes the session reappear on the destination and stops the source, with no other terminal opened by hand. Not taken: a mode for a person who starts a move and walks away (not asked).
 - **A move runs between the core's machine and its `hc` machines** (owner, 2026-11-14). `local` means the machine the core runs on, whichever it is: from dev-home that is dev-home with `base-digital`, `planet-argon`, `inovatec`; from a core on the Mac it is the Mac with dev-home. An init step or config that defines the machines comes first. Not taken: Mac and dev-home only (the Mac would have to join this core's topology first).
@@ -42,10 +43,12 @@ A session cannot move itself. `/teleport <machine>` typed into a coding-agent se
 - **On one disk the source stops before the destination resumes** (owner, 2026-11-14). Two processes on one transcript lose messages (https://code.claude.com/docs/en/sessions). The relocation stops the source, then resumes on the destination; when the destination does not come up, the rollback resumes the session again in the source's place. Not taken: freezing the source with `kill -STOP` while the destination comes up (two holders of the file, and `hc` has no such command); keeping resume then stop (the documented loss).
 - **Two machines on one disk may move directly** (owner, 2026-11-14). With no carry, the core need not be one end: `base-digital` to `planet-argon` relocates. A move between different disks keeps the core at one end. Not taken: the core at one end always (`mac_not_an_end`).
 - **The source's address is `$HC_SESSION/$HC_TERMINAL_ID`, against the default core** (design review, 2026-11-14). A terminal on `base-digital` carries `HC_SESSION=base-digital` and `HC_TERMINAL_ID=t7`; with `HC_SESSION` set, `hc machine ls` lists nothing, and without it `hc get base-digital/t7` resolves. The CLI and the detached terminal drop `HC_SESSION` and talk to the default core. This holds only for machines on the core's host.
+- **A labelled session resumes through `env`** (session, 2026-11-14, cheap to change). The wrappers (`claude-klock`) export `CLAUDE_CONFIG_DIR` and `exec claude`, so the foreground shows only `/home/ejklock/.local/bin/claude`, and `hc run` takes no environment. The resume is `env CLAUDE_CONFIG_DIR=<dir> <bin> <allowed flags> --resume <id>`, from the label's `env`, `bin` and `flags`, as herdr-wake records it; the preflight checks the program after the assignments. A terminal without a label keeps the launcher path of issue 0001.
+- **A move forgets the source's herdr-wake record** (session, 2026-11-14, cheap to change). herdr-wake keeps its record in the terminal's `wake` label and resumes it after a reboot; `herdr-wake forget <terminal>` removes it. Once the source is stopped, the move forgets its record, so the session never comes up twice. This lands with the relocation slice.
 
 ### Open questions
 
-- What herdr-wake resumes after a reboot once a move has stopped the source terminal (its `wake` label may bring the moved session up twice). Slice 1 checks it with `herdr-wake --help` and its label docs before its first test.
+- None.
 
 ### Acceptance
 

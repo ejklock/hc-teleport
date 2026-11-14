@@ -21,6 +21,7 @@ const terminalSchema = z.object({
     .nullish()
     .transform((status) => status ?? undefined),
   foreground: processSchema.optional(),
+  labels: z.record(z.string(), z.string()).optional(),
 });
 
 const machineSchema = z

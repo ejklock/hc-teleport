@@ -14,7 +14,9 @@ hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]
 
 The session is found from the terminal itself. For Claude Code, the config directory comes from `<launcher> --where` (a plain `claude` uses `~/.claude`), and `<configDir>/sessions/<foreground pid>.json` names the session id. That file is internal to Claude Code and undocumented, so an unknown shape refuses.
 
-The resume command is the terminal's executable (for example `claude-klock`), then its allowed flags in their order, then `--resume <id>`. Positional arguments and session selectors (`--resume`/`-r`, `--continue`/`-c`, `--session-id`, `--fork-session`) are dropped. Allowed flags:
+A terminal that carries a herdr-wake `wake` label (a `herdr-wake shell` terminal on dev-home) is found from that label instead: its `env.CLAUDE_CONFIG_DIR` is the config directory, `agent_proc.pid` must be the foreground process, and the registry file must name the label's `session_id`; the launcher's `--where` is never run. The foreground is recognized as Claude Code by the basename `claude`, so `/home/me/.local/bin/claude` counts.
+
+For a labelled terminal the resume command is `env CLAUDE_CONFIG_DIR=<dir> <bin> <allowed flags> --resume <id>`, taking the directory, `bin` and `flags` from the label (a wrapper such as `claude-klock` only exports the directory, so the wrapper name is lost); the preflight runs the program after `env` and its `NAME=value` words on the destination. Otherwise the resume command is the terminal's executable (for example `claude-klock`), then its allowed flags in their order, then `--resume <id>`. Positional arguments and session selectors (`--resume`/`-r`, `--continue`/`-c`, `--session-id`, `--fork-session`) are dropped. Allowed flags:
 
 - with one value: `--model`, `--permission-mode`, `--effort`, `--fallback-model`, `--agent`, `--name`/`-n` (`--flag value` and `--flag=value`);
 - with none: `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--brief`, `--chrome`, `--no-chrome`, `--verbose`.
@@ -69,12 +71,14 @@ A refusal prints `{"refused":{"reason":"...","detail":"..."}}` on stdout under `
 | `same_machine` | The terminal runs on the machine it would move to (`t6c local`, `dev-home/t6c dev-home`). |
 | `mac_not_an_end` | Neither end is the Mac (`dev-home/t6c vps`); a move goes between the Mac and one `hc` machine. |
 | `local_name_taken` | `hc machine ls` lists a machine named `local`, the name hc-teleport uses for the Mac; rename it with `hc machine rename`. |
-| `not_claude` | The terminal's foreground process is not `claude`. |
+| `not_claude` | The name of the terminal's foreground program (its basename) is not `claude`. |
+| `session_label_unreadable` | The `wake` label is not JSON, has a `v` other than 1, an `agent` other than `claude`, no `bin`, `session_id` or `agent_proc.pid`, no absolute `env.CLAUDE_CONFIG_DIR`, or a `bin` that is not the foreground program. |
 | `config_dir_unknown` | `<launcher> --where` failed or did not print an absolute path. |
 | `no_session` | The pid registry file does not exist. |
 | `session_registry_unreadable` | The registry file is malformed or lacks `sessionId` (a UUID), `pid` or `cwd`. |
 | `session_unreadable` | The source machine cannot read the session's subagent folder (a permission error, or a failed `find` on a machine); the detail names the folder. |
-| `session_registry_stale` | The registry's pid or cwd differs from the terminal's foreground process. |
+| `session_registry_stale` | The registry's pid or cwd differs from the terminal's foreground process, or the `wake` label's `agent_proc.pid` is not the foreground's. |
+| `session_mismatch` | The `wake` label and the pid registry name different sessions. |
 | `flag_not_allowed` | The source argv carries a flag outside the allowed list; the detail names it. |
 | `flag_missing_value` | An allowed flag that needs a value is the last token; the detail names it. |
 

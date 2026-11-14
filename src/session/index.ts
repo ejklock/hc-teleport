@@ -1,6 +1,6 @@
 import type { Hc, HcMachine as HcListedMachine, HcTerminal } from "../platform/hc.ts";
 import { HcMachine, LocalMachine, type Machine } from "../platform/machine.ts";
-import type { AdapterRefusalReason, AgentAdapter } from "./agent-adapter.ts";
+import type { AdapterRefusalReason, AgentAdapter, AgentSession, ResumeArgvResult } from "./agent-adapter.ts";
 import { ClaudeAdapter } from "./claude-adapter.ts";
 
 export type SessionPlan = {
@@ -100,6 +100,17 @@ function terminalRefusal(name: string, terminal: HcTerminal): PlanResult | undef
 }
 
 /**
+ * The resume command: from the agent's own launch record when the session has one, run through `env`
+ * so the config directory survives a wrapper that only exported it; else from the terminal's argv.
+ */
+function resumeOf(adapter: AgentAdapter, terminal: HcTerminal, session: AgentSession): ResumeArgvResult {
+  if (session.launch === undefined) return adapter.buildResumeArgv(terminal.argv, session.id);
+  const resume = adapter.buildResumeArgv([session.launch.bin, ...session.launch.flags], session.id);
+  if (!resume.ok) return resume;
+  return { ok: true, argv: ["env", `CLAUDE_CONFIG_DIR=${session.configDir}`, ...resume.argv] };
+}
+
+/**
  * Reads the terminal and the machines through `hc`, then works out what a move
  * would resume. The terminal address names the source (`tN` the Mac, `<machine>/tN`
  * an hc machine) and the session is read on it; `request.machine` is the
@@ -130,7 +141,7 @@ export async function planSession(
   }
   const found = await adapter.findSession(terminal);
   if (!found.ok) return found;
-  const resume = adapter.buildResumeArgv(terminal.argv, found.session.id);
+  const resume = resumeOf(adapter, terminal, found.session);
   if (!resume.ok) return resume;
 
   const { id, configDir, version, transcript } = found.session;

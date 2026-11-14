@@ -1,6 +1,6 @@
 import { HcError, type Hc, type HcExecResult } from "../platform/hc.ts";
 import { ProcessError, type Runner } from "../platform/process.ts";
-import type { AgentAdapter, DestinationRefusalReason } from "../session/agent-adapter.ts";
+import type { AgentAdapter, DestinationRefusalReason, RemoteRun } from "../session/agent-adapter.ts";
 import type { SessionPlan } from "../session/index.ts";
 
 const SPAWN_FAILED = '"kind":"spawn_failed"';
@@ -21,6 +21,21 @@ function homeOf(printed: HcExecResult, machine: string): string {
   throw new HcError(
     `printenv HOME on ${machine} gave no absolute home directory: exit code ${printed.code}, output ${JSON.stringify(home)}`,
   );
+}
+
+const ASSIGNMENT = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+
+/** The program a command runs: past a leading `env` and its NAME=value words, which become the environment. */
+function programOf(argv: readonly string[]): { executable: string | undefined; env: Record<string, string> } {
+  const env: Record<string, string> = {};
+  if (argv[0] !== "env") return { executable: argv[0], env };
+  let index = 1;
+  for (; index < argv.length; index += 1) {
+    const assignment = ASSIGNMENT.exec(argv[index] ?? "");
+    if (assignment === null) break;
+    env[assignment[1] ?? ""] = assignment[2] ?? "";
+  }
+  return { executable: argv[index], env };
 }
 
 /** The top level holding the plan's cwd on the source: through hc for a source on an hc machine, else on this machine. */
@@ -76,13 +91,27 @@ export async function preflight(
   }
 
   const home = homeOf(await run(["printenv", "HOME"]), machine);
-  const checked = await deps.adapter.checkDestination(
+  return checkAgent({ plan, home }, { machine, run }, deps.adapter);
+}
+
+async function checkAgent(
+  request: { plan: SessionPlan; home: string },
+  remote: RemoteRun,
+  adapter: AgentAdapter,
+): Promise<PreflightResult> {
+  const { plan, home } = request;
+  const command = programOf(plan.resume.argv);
+  if (command.executable === undefined) {
+    return refused("dest_executable_missing", `the resume command names no program to run on ${remote.machine}`);
+  }
+  const checked = await adapter.checkDestination(
     {
-      executable: plan.resume.argv[0] ?? "",
+      executable: command.executable,
+      env: command.env,
       home,
       ...(plan.session.version === undefined ? {} : { sourceVersion: plan.session.version }),
     },
-    { machine, run },
+    remote,
   );
   if (!checked.ok) return checked;
   return { ok: true, destination: { home, configDir: checked.configDir, version: checked.version } };

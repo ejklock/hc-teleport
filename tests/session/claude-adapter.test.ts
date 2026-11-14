@@ -18,7 +18,7 @@ function macAt(homeDir: string): Machine {
 /** A machine whose files, kinds and programs are what the test says; it records every program it ran. */
 class StubMachine implements Machine {
   readonly name: string;
-  readonly files = new Map<string, string | MachineErrorCode>();
+  readonly files = new Map<string, string>();
   readonly kinds = new Map<string, EntryKind>();
   readonly ran: (readonly string[])[] = [];
   readonly limits: (number | undefined)[] = [];
@@ -570,5 +570,163 @@ describe("confirms the session resumed", () => {
       else expect(program).toBe("test");
       expect(rest.filter((arg) => arg.startsWith("-") && arg !== "--" && arg !== "-e")).toEqual([]);
     }
+  });
+});
+
+describe("recognizes claude", () => {
+  it.each([
+    ["claude", ["claude"], true],
+    ["an absolute path whose basename is claude", ["/home/ejklock/.local/bin/claude", "--resume", SESSION_ID], true],
+    ["a shell", ["/usr/bin/zsh"], false],
+    ["a wrapper that only starts with claude", ["/opt/claude-klock"], false],
+    ["a program that only starts with claude", ["claudex"], false],
+  ])("in a foreground of %s", async (_title, argv, expected) => {
+    const base = await terminalFixture();
+    const foreground = base.foreground === undefined ? undefined : { ...base.foreground, argv };
+
+    const recognized = new ClaudeAdapter(new StubMachine("box")).recognizes({
+      ...base,
+      ...(foreground === undefined ? {} : { foreground }),
+    });
+
+    expect(recognized).toBe(expected);
+  });
+
+  it("in no terminal that has no foreground", async () => {
+    const { foreground, ...base } = await terminalFixture();
+
+    expect(foreground).toBeDefined();
+    expect(new ClaudeAdapter(new StubMachine("box")).recognizes(base)).toBe(false);
+  });
+});
+
+describe("finds a labelled session", () => {
+  const LABEL_DIR = "/home/u/.claude-klock";
+  const BIN = "/home/u/.local/bin/claude";
+  let machine: StubMachine;
+
+  function label(overrides: Record<string, unknown> = {}, pidOverride?: number): string {
+    return JSON.stringify({
+      v: 1,
+      agent: "claude",
+      session_id: SESSION_ID,
+      cwd: "/ignored",
+      flags: [],
+      env: { CLAUDE_CONFIG_DIR: LABEL_DIR, LANG: "en_US.UTF-8" },
+      bin: BIN,
+      agent_proc: { pid: pidOverride ?? 84526, start: 1837 },
+      state: "running",
+      ...overrides,
+    });
+  }
+
+  async function labelled(wake: string | undefined): Promise<HcTerminal> {
+    const base = await terminalFixture();
+    const foreground = base.foreground === undefined ? undefined : { ...base.foreground, argv: [BIN] };
+    return {
+      ...base,
+      argv: ["/home/u/.local/bin/herdr-wake", "shell"],
+      ...(foreground === undefined ? {} : { foreground }),
+      ...(wake === undefined ? {} : { labels: { wake, other: "x" } }),
+    };
+  }
+
+  function registry(overrides: Record<string, unknown> = {}, pid = 84526): void {
+    machine.files.set(
+      join(LABEL_DIR, "sessions", `${pid}.json`),
+      JSON.stringify({ pid, sessionId: SESSION_ID, cwd: "/Volumes/Developer/www/klock-tecnologia/hc-teleport", version: "2.1.321", ...overrides }),
+    );
+  }
+
+  beforeEach(() => {
+    machine = new StubMachine("box");
+  });
+
+  it("in the label's config dir when the registry agrees, without running the launcher", async () => {
+    registry();
+
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(label({ flags: ["--model", "opus"] })));
+
+    expect(result).toEqual({
+      ok: true,
+      session: {
+        id: SESSION_ID,
+        configDir: LABEL_DIR,
+        version: "2.1.321",
+        transcript: { file: join(LABEL_DIR, "projects", "-Volumes-Developer-www-klock-tecnologia-hc-teleport", `${SESSION_ID}.jsonl`) },
+        launch: { bin: BIN, flags: ["--model", "opus"] },
+      },
+    });
+    expect(machine.ran).toEqual([]);
+  });
+
+  it("with the label's bin when it is the foreground program", async () => {
+    registry();
+
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(label()));
+
+    expect(result.ok && result.session.launch?.bin).toBe(BIN);
+  });
+
+  it("refuses as session_mismatch when the registry names another session", async () => {
+    registry({ sessionId: "11111111-1111-4111-8111-111111111111" });
+
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(label()));
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "session_mismatch" } });
+  });
+
+  it("refuses as session_registry_stale when the label names another process", async () => {
+    registry();
+
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(label({}, 1)));
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "session_registry_stale" } });
+  });
+
+  it("refuses as session_registry_stale when the registry's folder is not the terminal's", async () => {
+    registry({ cwd: "/elsewhere" });
+
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(label()));
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "session_registry_stale" } });
+  });
+
+  it("refuses as no_session when the registry file is absent", async () => {
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(label()));
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "no_session" } });
+  });
+
+  it.each([
+    ["not JSON", "{nope"],
+    ["a version other than 1", label({ v: 2 })],
+    ["another agent", label({ agent: "codex" })],
+    ["a relative config dir", label({ env: { CLAUDE_CONFIG_DIR: "rel/dir" } })],
+    ["no config dir", label({ env: {} })],
+    ["no bin", label({ bin: undefined })],
+    ["a bin that reads as an option", label({ bin: "-i" })],
+    ["a relative bin", label({ bin: "claude" })],
+    ["a bin that reads as an assignment", label({ bin: "FOO=bar" })],
+    ["another program's bin", label({ bin: "/bin/sh" })],
+    ["a bin with a trailing space", label({ bin: `${BIN} ` })],
+  ])("refuses as session_label_unreadable for a label that is %s", async (_title, wake) => {
+    registry();
+
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(wake));
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "session_label_unreadable", detail: expect.stringContaining("t6c") } });
+    expect(machine.ran).toEqual([]);
+  });
+
+  it("takes the launcher path when the terminal has no wake label", async () => {
+    const base = await terminalFixture();
+    const pid = base.foreground?.pid ?? 0;
+    await writeRegistry(join(home, ".claude"), pid, { pid, sessionId: SESSION_ID, cwd: base.cwd });
+
+    const result = await new ClaudeAdapter(macAt(home)).findSession({ ...base, argv: ["claude"], labels: { where: "x" } });
+
+    expect(result.ok && result.session.configDir).toBe(join(home, ".claude"));
+    expect(result.ok && result.session.launch).toBeUndefined();
   });
 });

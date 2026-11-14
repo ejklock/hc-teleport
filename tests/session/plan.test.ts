@@ -184,3 +184,71 @@ describe("plans a refusal of a move that does not have the Mac at exactly one en
     expect(calls).toEqual([]);
   });
 });
+
+describe("resumes a labelled session through env", () => {
+  const BIN = "/home/u/.local/bin/claude";
+  let configDir: string;
+
+  async function planLabelled(flags: string[], wakeFlagsExtra: Record<string, unknown> = {}) {
+    configDir = join(home, ".claude-klock");
+    await mkdir(join(configDir, "sessions"), { recursive: true });
+    await writeFile(join(configDir, "sessions", `${pid}.json`), registry());
+    const wake = JSON.stringify({
+      v: 1,
+      agent: "claude",
+      session_id: SESSION_ID,
+      flags,
+      env: { CLAUDE_CONFIG_DIR: configDir },
+      bin: BIN,
+      agent_proc: { pid },
+      ...wakeFlagsExtra,
+    });
+    const hc = new Hc((_program, args) => {
+      if (args[0] === "get") {
+        return Promise.resolve(
+          JSON.stringify({
+            ...fixture,
+            address: args[3],
+            argv: ["/home/u/.local/bin/herdr-wake", "shell"],
+            status: { state: "done" },
+            labels: { wake },
+            foreground: { ...(fixture["foreground"] as object), argv: [BIN] },
+          }),
+        );
+      }
+      return Promise.resolve(JSON.stringify({ machines: listed }));
+    });
+    return planSession({ terminal: "t6c", machine: "dev-home" }, { hc, home, machines: () => remote });
+  }
+
+  it("with the label's config dir and program and no flags", async () => {
+    const result = await planLabelled([]);
+
+    expect(result.ok && result.plan.resume.argv).toEqual(["env", `CLAUDE_CONFIG_DIR=${configDir}`, BIN, "--resume", SESSION_ID]);
+    expect(result.ok && result.plan.session.configDir).toBe(configDir);
+  });
+
+  it("keeping an allowed flag before --resume", async () => {
+    const result = await planLabelled(["--model", "opus"]);
+
+    expect(result.ok && result.plan.resume.argv).toEqual(["env", `CLAUDE_CONFIG_DIR=${configDir}`, BIN, "--model", "opus", "--resume", SESSION_ID]);
+  });
+
+  it("refuses a flag outside the allow-list", async () => {
+    const result = await planLabelled(["--mcp-config", "x"]);
+
+    expect(result).toEqual({ ok: false, refusal: { reason: "flag_not_allowed", detail: "--mcp-config" } });
+  });
+
+  it("dropping a --resume already in the flags", async () => {
+    const result = await planLabelled(["--resume", SESSION_ID, "--verbose"]);
+
+    expect(result.ok && result.plan.resume.argv).toEqual(["env", `CLAUDE_CONFIG_DIR=${configDir}`, BIN, "--verbose", "--resume", SESSION_ID]);
+  });
+
+  it("while an unlabelled terminal keeps the argv it started with", async () => {
+    const result = await plan("t6c", "dev-home");
+
+    expect(result.ok && result.plan.resume.argv).toEqual(["claude", "--resume", SESSION_ID]);
+  });
+});

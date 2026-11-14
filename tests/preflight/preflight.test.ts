@@ -294,6 +294,29 @@ describe("refuses a destination", () => {
   });
 });
 
+describe("checks the program after env", () => {
+  const BIN = "/home/u/.local/bin/claude";
+  const CONFIG_DIR = "/home/u/.claude-klock";
+
+  it("running the program and reading the profile the assignments name", async () => {
+    const state = box({ programs: { [BIN]: { version: "2.1.321 (Claude Code)" } }, dirs: [CONFIG_DIR] });
+
+    const { hc, result } = run(state, planWith({ argv: ["env", `CLAUDE_CONFIG_DIR=${CONFIG_DIR}`, BIN, "--resume", "x"] }));
+
+    expect(await result).toEqual({ ok: true, destination: { home: HOME, configDir: CONFIG_DIR, version: "2.1.321" } });
+    expect(hc.argvs).toContainEqual([BIN, "--version"]);
+    expect(hc.argvs.some((argv) => argv[0] === "env")).toBe(false);
+    expect(hc.argvs.some((argv) => argv.includes("--where"))).toBe(false);
+  });
+
+  it("with dest_executable_missing when no program follows the assignments", async () => {
+    const { hc, result } = run(box(), planWith({ argv: ["env", `CLAUDE_CONFIG_DIR=${CONFIG_DIR}`] }));
+
+    expect(await result).toMatchObject({ ok: false, refusal: { reason: "dest_executable_missing" } });
+    expect(hc.argvs.some((argv) => argv[0] === "env")).toBe(false);
+  });
+});
+
 describe("only reads", () => {
   const READ_ONLY: ((argv: readonly string[]) => boolean)[] = [
     (argv) => argv.join(" ") === `git -C ${CWD} rev-parse --show-toplevel` || argv.join(" ") === `git -C ${SUBDIRECTORY} rev-parse --show-toplevel`,

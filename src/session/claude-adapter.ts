@@ -1,4 +1,4 @@
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { z } from "zod";
 import type { HcTerminal } from "../platform/hc.ts";
 import { MachineError, type Machine } from "../platform/machine.ts";
@@ -26,6 +26,19 @@ const registrySchema = z.object({
   version: z.string().optional(),
 });
 
+// herdr-wake's record of a running session is a third party's JSON in a terminal label: only what the
+// resume and the registry check read is required, and every other field may change shape.
+const wakeLabelSchema = z.object({
+  v: z.literal(1),
+  agent: z.literal("claude"),
+  session_id: z.uuid(),
+  bin: z.string().min(1),
+  flags: z.array(z.string()).default([]),
+  env: z.object({ CLAUDE_CONFIG_DIR: z.string().refine((dir) => isAbsolute(dir)) }),
+  agent_proc: z.object({ pid: z.number().int() }),
+});
+
+type WakeLabel = z.infer<typeof wakeLabelSchema>;
 type Registry = z.infer<typeof registrySchema>;
 type Refusal = Extract<SessionResult, { ok: false }>;
 type DestinationRefusal = Extract<DestinationResult, { ok: false }>;
@@ -66,6 +79,20 @@ function parseRegistry(text: string, file: string): Registry | Refusal {
   return parsed.data;
 }
 
+function parseWakeLabel(text: string, address: string): WakeLabel | Refusal {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return refuse("session_label_unreadable", `the wake label of ${address} is not valid JSON`);
+  }
+  const parsed = wakeLabelSchema.safeParse(json);
+  if (!parsed.success) {
+    return refuse("session_label_unreadable", `the wake label of ${address} has an unknown shape: ${parsed.error.message}`);
+  }
+  return parsed.data;
+}
+
 function refuse(reason: AdapterRefusalReason, detail: string): Refusal {
   return { ok: false, refusal: { reason, detail } };
 }
@@ -88,7 +115,8 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   recognizes(terminal: HcTerminal): boolean {
-    return terminal.foreground?.argv[0] === "claude";
+    const program = terminal.foreground?.argv[0];
+    return program !== undefined && basename(program) === "claude";
   }
 
   buildResumeArgv(source: readonly string[], sessionId: string): ResumeArgvResult {
@@ -96,13 +124,13 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   async checkDestination(request: DestinationRequest, remote: RemoteRun): Promise<DestinationResult> {
-    const { executable, home } = request;
+    const { executable } = request;
     const printed = await remote.run([executable, "--version"]);
     if (printed.code !== 0) {
       const why = printed.stderr.trim() || `exit ${printed.code}`;
       return refuseDestination("dest_executable_missing", `${executable} does not run on ${remote.machine}: ${why}`);
     }
-    const configDir = await this.#destinationConfigDir(executable, home, remote);
+    const configDir = await this.#destinationConfigDir(request, remote);
     if (typeof configDir !== "string") return configDir;
 
     const version = parseVersion(printed.stdout);
@@ -168,9 +196,11 @@ export class ClaudeAdapter implements AgentAdapter {
     return parseRegistry(read.stdout, file);
   }
 
-  async #destinationConfigDir(executable: string, home: string, remote: RemoteRun): Promise<string | DestinationRefusal> {
-    let configDir = `${home}/.claude`;
-    if (executable !== "claude") {
+  async #destinationConfigDir(request: DestinationRequest, remote: RemoteRun): Promise<string | DestinationRefusal> {
+    const { executable, home } = request;
+    const assigned = request.env?.["CLAUDE_CONFIG_DIR"];
+    let configDir = assigned ?? `${home}/.claude`;
+    if (assigned === undefined && executable !== "claude") {
       const where = await remote.run([executable, "--where"]);
       const printed = where.stdout.trim();
       if (where.code !== 0 || !isAbsolute(printed)) {
@@ -188,9 +218,35 @@ export class ClaudeAdapter implements AgentAdapter {
     if (foreground === undefined || !this.recognizes(terminal)) {
       return refuse("not_claude", `the foreground process of ${terminal.address} is not claude`);
     }
-    const configDir = await this.#configDir(terminal.argv[0] ?? "");
-    if (typeof configDir !== "string") return configDir;
+    const wake = terminal.labels?.["wake"];
+    if (wake === undefined) {
+      const configDir = await this.#configDir(terminal.argv[0] ?? "");
+      return typeof configDir === "string" ? this.#confirmed({ terminal, foreground, configDir }) : configDir;
+    }
+    const label = parseWakeLabel(wake, terminal.address);
+    if ("ok" in label) return label;
+    // The bin reaches the resume argv, so only the program that is running may stand for it.
+    if (label.bin !== foreground.argv[0]) {
+      return refuse(
+        "session_label_unreadable",
+        `the wake label of ${terminal.address} names the program ${JSON.stringify(label.bin)}, not the foreground program`,
+      );
+    }
+    if (label.agent_proc.pid !== foreground.pid) {
+      return refuse(
+        "session_registry_stale",
+        `the wake label of ${terminal.address} describes pid ${label.agent_proc.pid}, not the foreground process ${foreground.pid}`,
+      );
+    }
+    return this.#confirmed({ terminal, foreground, configDir: label.env.CLAUDE_CONFIG_DIR }, label);
+  }
 
+  /** The session the pid registry names for the foreground process, once the label, when there is one, agrees. */
+  async #confirmed(
+    found: { terminal: HcTerminal; foreground: { pid: number; cwd: string }; configDir: string },
+    label?: WakeLabel,
+  ): Promise<SessionResult> {
+    const { terminal, foreground, configDir } = found;
     const registry = await this.#readRegistry(configDir, foreground.pid);
     if ("ok" in registry) return registry;
     if (registry.pid !== foreground.pid || registry.cwd !== foreground.cwd || registry.cwd !== terminal.cwd) {
@@ -199,7 +255,13 @@ export class ClaudeAdapter implements AgentAdapter {
         `the registry entry of pid ${registry.pid} does not match the terminal's foreground process`,
       );
     }
-    return this.#describe(configDir, registry);
+    if (label !== undefined && registry.sessionId !== label.session_id) {
+      return refuse(
+        "session_mismatch",
+        `the wake label of ${terminal.address} names session ${label.session_id}, the registry names ${registry.sessionId}`,
+      );
+    }
+    return this.#describe(configDir, registry, label);
   }
 
   async #configDir(launcher: string): Promise<string | Refusal> {
@@ -234,7 +296,7 @@ export class ClaudeAdapter implements AgentAdapter {
     return parseRegistry(text, file);
   }
 
-  async #describe(configDir: string, registry: Registry): Promise<SessionResult> {
+  async #describe(configDir: string, registry: Registry, label: WakeLabel | undefined): Promise<SessionResult> {
     const projectDir = join(configDir, "projects", projectDirName(registry.cwd));
     const subagentDir = join(projectDir, registry.sessionId);
     let kind;
@@ -252,6 +314,7 @@ export class ClaudeAdapter implements AgentAdapter {
         file: join(projectDir, `${registry.sessionId}.jsonl`),
         ...(kind === "dir" ? { dir: subagentDir } : {}),
       },
+      ...(label === undefined ? {} : { launch: { bin: label.bin, flags: label.flags } }),
     };
     return { ok: true, session };
   }

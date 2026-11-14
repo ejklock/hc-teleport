@@ -5,6 +5,8 @@ export type AgentSession = {
   configDir: string;
   version?: string;
   transcript: { file: string; dir?: string };
+  /** The program and flags the agent recorded for its own launch, when the session was found by that record. */
+  launch?: { bin: string; flags: readonly string[] };
 };
 
 export type AdapterRefusalReason =
@@ -12,6 +14,7 @@ export type AdapterRefusalReason =
   | "config_dir_unknown"
   | "no_session"
   | "session_registry_unreadable"
+  | "session_label_unreadable"
   | "session_registry_stale"
   | "session_unreadable"
   | "session_mismatch"
@@ -44,6 +47,8 @@ export type DestinationRequest = {
   executable: string;
   /** The destination user's home directory. */
   home: string;
+  /** The environment assignments that precede the executable in the resume command. */
+  env?: Readonly<Record<string, string>>;
   /** What the source ran, as that agent prints it. */
   sourceVersion?: string;
 };

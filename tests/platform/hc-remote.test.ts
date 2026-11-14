@@ -382,4 +382,12 @@ describe("Hc get", () => {
     expect(calls[0]?.file).toBe("hc");
     expect(calls[0]?.args).toEqual(["get", "--json", "--", address]);
   });
+
+  it("reads the labels of a terminal as strings and keeps the terminal without any", async () => {
+    const labelled = recording(JSON.stringify({ address: "t7", argv: ["x"], cwd: "/", state: "live", labels: { wake: "{}", where: "w" } }));
+    const bare = recording(JSON.stringify({ address: "t7", argv: ["x"], cwd: "/", state: "live" }));
+
+    expect((await new Hc(labelled.run).terminal("t7")).labels).toEqual({ wake: "{}", where: "w" });
+    expect((await new Hc(bare.run).terminal("t7")).labels).toBeUndefined();
+  });
 });
