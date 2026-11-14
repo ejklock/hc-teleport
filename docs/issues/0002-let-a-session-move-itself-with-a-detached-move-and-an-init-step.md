@@ -1,0 +1,66 @@
+---
+type: Issue
+title: Let a session move itself with a detached move and an init step
+description: <One sentence — the change and its motivation.>
+status: open
+timestamp: 2026-11-14T15:45:31Z
+---
+
+## 0002. Let a session move itself with a detached move and an init step
+
+### Context
+
+A session cannot move itself. `/teleport <machine>` typed into a coding-agent session runs while that session is busy, so the plan refuses with `not_idle` (`src/session/index.ts`) and the move rechecks with `source_not_idle` (`src/move/move.ts`). The owner wants harness plugins (a slash command and a skill per harness) that call the CLI, and they need the move to run detached from the session it moves. The `hc` core now also runs on dev-home, where `hc machine ls` lists `base-digital`, `planet-argon` and `inovatec` (all with host `dev-home`) and no Mac; `hc-teleport` is installed there by se-configs.
+
+### Scope
+
+- Identifying a real session: the herdr-wake `wake` label checked against the pid registry, so a dry-run on a dev-home terminal plans instead of refusing `not_claude`.
+- `hc-teleport init` (an interactive wizard) and `hc-teleport doctor`, with a required config that stores decisions only.
+- The relocation between machines on one disk, the source stopped first.
+- A detached mode: the CLI starts the move in its own `hc` terminal, which outlives the source, waits until the source is idle, then moves; `hc-teleport status` reads the result.
+- The harness plugins (a slash command and a skill per harness), in se-configs, as the last slice.
+- Out: an MCP server; the Mac as a machine of the dev-home core; a self-move from a machine reached over SSH.
+
+### Decision
+
+
+
+
+- **Plugins call the CLI; no MCP server** (owner, 2026-11-14). A slash command and a skill per harness run `hc-teleport`, with `--json` as the contract. Not taken: an MCP server (an extra process per profile that runs inside the session it would stop, and a second contract); the CLI alone (the agent would not know the tool exists).
+- **The detached mode lets a session move itself** (owner, 2026-11-14). Done when `/teleport <machine>` inside a session makes the session reappear on the destination and stops the source, with no other terminal opened by hand. Not taken: a mode for a person who starts a move and walks away (not asked).
+- **A move runs between the core's machine and its `hc` machines** (owner, 2026-11-14). `local` means the machine the core runs on, whichever it is: from dev-home that is dev-home with `base-digital`, `planet-argon`, `inovatec`; from a core on the Mac it is the Mac with dev-home. An init step or config that defines the machines comes first. Not taken: Mac and dev-home only (the Mac would have to join this core's topology first).
+- **A move between machines on one disk relocates without copying** (owner, 2026-11-14). `base-digital`, `planet-argon` and `inovatec` run as the same user, on host `dev-home`, with home `/home/ejklock` (checked with `hc exec --on <m> whoami`, `hostname`, `printenv HOME`). When the destination shares the source's disk, the move skips the git and transcript carry and the park: it resumes on the destination and stops the source. Not taken: refusing with `same_disk` (from this core no move would work until the Mac joins).
+- **`hc-teleport init` stores decisions only** (owner, 2026-11-14; replaces the earlier bullet that stored host and home, after the design review). The config holds the machines allowed to receive a session. The core's name (`hc server status` `.core.name`), each machine's host (`hc machine ls` `.host`) and home are read at move time, and one disk is proved at move time by the transcript's device and inode seen from both ends. The doctor runs the preflight on each allowed machine, reports drift, and writes nothing. Not taken: storing the core name, host and home per machine (they drift on `hc machine add|rename|rm`, and equal host and home only suggest one disk).
+- **`init` is an interactive wizard** (owner, 2026-11-14). It asks machine by machine. Not taken: one command that discovers and confirms, with `--yes` for a plugin; a hand-edited file the CLI only validates.
+- **A detached move that fails reports twice** (owner, 2026-11-14): the detached terminal types the reason into the source session with `hc send`, and writes the result to a status file that `hc-teleport status` reads. Not taken: only the message; only the file.
+- **Defaults the session chose** (session, 2026-11-14, cheap to change): the config lives in `~/.config/hc-teleport/config.json`; `init` without a terminal refuses instead of waiting, and `not_initialized` names `hc-teleport init`; the detached terminal waits up to 300 s for the source to be idle, under a new `--wait` flag (`--timeout` keeps meaning the destination's come-up); a lock per session id makes a second `/teleport` refuse with `move_in_progress`; the detached move writes its phase to `~/.local/state/hc-teleport/<session id>.json` before each step, and `hc-teleport status` checks that the detached terminal still lives; the skill ends its turn right after `--detach`; a self-move from a machine reached over SSH, which cannot reach its core, refuses by name.
+- **The config is required** (owner, 2026-11-14). Every move refuses with `not_initialized` until `hc-teleport init` has run on the core's machine. Not taken: optional, with v0.1.0's behavior without a config (two paths to keep).
+- **A source that works again during the wait keeps the wait going** (owner, 2026-11-14). The detached terminal waits until the source is idle again, up to `--timeout`; the check right before the source is stopped stays as it is. Not taken: giving up the first time the source works again.
+- **The Mac stays out of this issue** (owner, 2026-11-14). A move between the Mac and dev-home from this core would add the Mac with `hc machine add` and give dev-home a credential for the Mac, against issue 0001. Not taken: adding it here.
+- **Slices in this order** (owner, 2026-11-14): `init` and the doctor; the relocation on one disk; the detached mode with its status; the harness plugins, in se-configs. Not taken: the detached mode first.
+- **The session is identified by the herdr-wake label, checked against the pid registry** (owner, 2026-11-14; bends issue 0001's "session id from the pid registry"). On dev-home every terminal runs `herdr-wake shell` and its foreground is `/home/ejklock/.local/bin/claude` (`hc get t20`), so `recognizes()` (`src/session/claude-adapter.ts`) refuses every real session with `not_claude` and the config directory, read from the terminal's `argv[0]`, is wrong. The `wake` label gives `session_id`, `session_file`, `cwd`, `flags` and `CLAUDE_CONFIG_DIR`; `<configDir>/sessions/<foreground pid>.json` must name the same session id. Not taken: only the pid registry, accepting a full path and reading `CLAUDE_CONFIG_DIR` from `/proc/<pid>/environ` (no `/proc` on macOS); only the label (no proof it still describes the live process). Issue 0001 rejected a labelling hook because nothing installed one; herdr-wake now writes the label.
+- **On one disk the source stops before the destination resumes** (owner, 2026-11-14). Two processes on one transcript lose messages (https://code.claude.com/docs/en/sessions). The relocation stops the source, then resumes on the destination; when the destination does not come up, the rollback resumes the session again in the source's place. Not taken: freezing the source with `kill -STOP` while the destination comes up (two holders of the file, and `hc` has no such command); keeping resume then stop (the documented loss).
+- **Two machines on one disk may move directly** (owner, 2026-11-14). With no carry, the core need not be one end: `base-digital` to `planet-argon` relocates. A move between different disks keeps the core at one end. Not taken: the core at one end always (`mac_not_an_end`).
+- **The source's address is `$HC_SESSION/$HC_TERMINAL_ID`, against the default core** (design review, 2026-11-14). A terminal on `base-digital` carries `HC_SESSION=base-digital` and `HC_TERMINAL_ID=t7`; with `HC_SESSION` set, `hc machine ls` lists nothing, and without it `hc get base-digital/t7` resolves. The CLI and the detached terminal drop `HC_SESSION` and talk to the default core. This holds only for machines on the core's host.
+
+### Open questions
+
+- What herdr-wake resumes after a reboot once a move has stopped the source terminal (its `wake` label may bring the moved session up twice). Slice 1 checks it with `herdr-wake --help` and its label docs before its first test.
+
+### Acceptance
+
+- `hc-teleport t20 base-digital --dry-run --json` on a live dev-home Claude Code terminal (terminal `herdr-wake shell`, foreground `/home/ejklock/.local/bin/claude`) prints a plan whose session id and config dir match its `wake` label; a label whose session id the pid registry does not confirm refuses. Proved by unit tests with a fake `hc` and by that dry-run.
+- `hc-teleport init` in a terminal asks which machines of `hc machine ls` may receive a session and writes `~/.config/hc-teleport/config.json`; without a terminal it refuses. Proved by a test that drives the wizard with a fake `hc` and reads the file.
+- `hc-teleport doctor` runs the preflight on each allowed machine, prints one line per machine, reports a config machine `hc machine ls` no longer lists, and writes nothing. Proved by a test with one passing, one failing and one missing machine.
+- Any move without the config refuses with `not_initialized`, exit 3, naming `hc-teleport init`; a move to a machine not allowed refuses with `machine_not_allowed`, exit 3. Proved by tests.
+- A move between two machines proved on one disk stops the source, then resumes on the destination, and writes no ref, no transcript file and no park; the transcript has the same lines before and after. When the destination does not come up, the session is resumed again on the source machine and the transcript is unchanged. A move between different disks still carries git and the transcript. Proved by tests with a fake `hc` and by bed cases.
+- `hc-teleport <machine> --detach` from inside a session starts its own `hc` terminal with no parent, which waits up to `--wait` seconds (300 by default) for the source to be idle, then moves. A second `--detach` for the same session refuses `move_in_progress`. On a failure it types the reason into the source and writes the status file; `hc-teleport status` prints the phase and whether the detached terminal still lives. Proved by tests with a fake `hc`, including a detached terminal that dies mid-move, and a bed case.
+- A `/teleport <machine>` command and a skill for each harness in se-configs call the CLI with `--detach` and end the turn. Proved by se-configs' bats tests for the installed files.
+
+### Plan
+
+- S1: a dry-run plans a real herdr-wake session (label checked against the pid registry) | files: src/session/claude-adapter.ts, src/session/index.ts, src/platform/hc.ts, tests/session/* | after: none
+- S2: `init` wizard, required config, `doctor`, `not_initialized` and `machine_not_allowed` | files: src/config/* (new), src/app/cli.ts, src/move/move.ts, tests/config/*, tests/cli/* | after: S1
+- S3: relocation on one disk, source stopped first, machine to machine allowed | files: src/move/*, src/session/index.ts, tests/move/*, tests/bed/* | after: S2
+- S4: `--detach`, `--wait`, lock, phase file, `status`, failure typed into the source | files: src/detach/* (new), src/app/cli.ts, tests/detach/*, tests/bed/* | after: S3
+- S5: `/teleport` command and skill per harness | files: in se-configs | after: S4 released
