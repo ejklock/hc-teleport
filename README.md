@@ -92,7 +92,7 @@ A refusal prints `{"refused":{"reason":"...","detail":"..."}}` on stdout under `
 | `mac_not_an_end` | Neither end is the Mac (`dev-home/t6c vps`); a move goes between the Mac and one `hc` machine. |
 | `local_name_taken` | `hc machine ls` lists a machine named `local`, the name hc-teleport uses for the Mac; rename it with `hc machine rename`. |
 | `not_claude` | The name of the terminal's foreground program (its basename) is not `claude`. |
-| `session_label_unreadable` | The `wake` label is not JSON, has a `v` other than 1, an `agent` other than `claude`, no `bin`, `session_id` or `agent_proc.pid`, no absolute `env.CLAUDE_CONFIG_DIR`, or a `bin` that is not the foreground program. |
+| `session_label_unreadable` | The `wake` label is not JSON, has a `v` other than 1, an `agent` other than `claude`, no `bin`, `session_id` or `agent_proc.pid`, no absolute `env.CLAUDE_CONFIG_DIR`, or a `bin` that is not an absolute path to the foreground program (the foreground may show the bare program name a wrapper leaves behind). |
 | `config_dir_unknown` | `<launcher> --where` failed or did not print an absolute path. |
 | `no_session` | The pid registry file does not exist. |
 | `session_registry_unreadable` | The registry file is malformed or lacks `sessionId` (a UUID), `pid` or `cwd`. |

@@ -93,6 +93,15 @@ function parseWakeLabel(text: string, address: string): WakeLabel | Refusal {
   return parsed.data;
 }
 
+/**
+ * Whether an absolute `bin` is the program a foreground argv[0] names: the same path, or the bare name a
+ * wrapper's `exec` leaves behind for the `bin` it resolved.
+ */
+function isRunningProgram(bin: string, program: string | undefined): boolean {
+  if (program === undefined || !isAbsolute(bin)) return false;
+  return program === bin || (!program.includes("/") && program === basename(bin));
+}
+
 function refuse(reason: AdapterRefusalReason, detail: string): Refusal {
   return { ok: false, refusal: { reason, detail } };
 }
@@ -226,7 +235,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const label = parseWakeLabel(wake, terminal.address);
     if ("ok" in label) return label;
     // The bin reaches the resume argv, so only the program that is running may stand for it.
-    if (label.bin !== foreground.argv[0]) {
+    if (!isRunningProgram(label.bin, foreground.argv[0])) {
       return refuse(
         "session_label_unreadable",
         `the wake label of ${terminal.address} names the program ${JSON.stringify(label.bin)}, not the foreground program`,

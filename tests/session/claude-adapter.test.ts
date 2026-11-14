@@ -21,6 +21,7 @@ class StubMachine implements Machine {
   readonly files = new Map<string, string>();
   readonly kinds = new Map<string, EntryKind>();
   readonly ran: (readonly string[])[] = [];
+  readonly reads: string[] = [];
   readonly limits: (number | undefined)[] = [];
   kindFailure: MachineErrorCode | undefined;
   where: ExecResult = { code: 0, stdout: "", stderr: "" };
@@ -41,6 +42,7 @@ class StubMachine implements Machine {
   }
 
   readFile(path: string): Promise<string> {
+    this.reads.push(path);
     const content = this.files.get(path) ?? "ENOENT";
     if (content === "ENOENT" || content === "not_text" || content === "failed") {
       return Promise.reject(new MachineError(this.name, content, `read ${path}`));
@@ -620,9 +622,9 @@ describe("finds a labelled session", () => {
     });
   }
 
-  async function labelled(wake: string | undefined): Promise<HcTerminal> {
+  async function labelled(wake: string | undefined, foregroundProgram: string = BIN): Promise<HcTerminal> {
     const base = await terminalFixture();
-    const foreground = base.foreground === undefined ? undefined : { ...base.foreground, argv: [BIN] };
+    const foreground = base.foreground === undefined ? undefined : { ...base.foreground, argv: [foregroundProgram] };
     return {
       ...base,
       argv: ["/home/u/.local/bin/herdr-wake", "shell"],
@@ -666,6 +668,34 @@ describe("finds a labelled session", () => {
     const result = await new ClaudeAdapter(machine).findSession(await labelled(label()));
 
     expect(result.ok && result.session.launch?.bin).toBe(BIN);
+  });
+
+  it("when a wrapper left the bare program name in the foreground and the label holds its absolute path to it", async () => {
+    registry();
+
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(label(), "claude"));
+
+    expect(result.ok && result.session.launch?.bin).toBe(BIN);
+    const launch = result.ok ? result.session.launch : undefined;
+    expect(launch && new ClaudeAdapter(machine).buildResumeArgv([launch.bin, ...launch.flags], SESSION_ID)).toEqual({
+      ok: true,
+      argv: [BIN, "--resume", SESSION_ID],
+    });
+  });
+
+  it.each([
+    ["a bare foreground and a shell bin", "claude", "/bin/sh"],
+    ["a bare foreground and a relative bin", "claude", "claude"],
+    ["a bare foreground and a bin of another basename", "claude", "/x/claudex"],
+    ["an absolute foreground of another path", "/opt/claude", BIN],
+  ])("refuses as session_label_unreadable for %s without reading the registry", async (_title, program, bin) => {
+    registry();
+
+    const result = await new ClaudeAdapter(machine).findSession(await labelled(label({ bin }), program));
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "session_label_unreadable" } });
+    expect(machine.reads).toEqual([]);
+    expect(machine.ran).toEqual([]);
   });
 
   it("refuses as session_mismatch when the registry names another session", async () => {
@@ -716,6 +746,7 @@ describe("finds a labelled session", () => {
     const result = await new ClaudeAdapter(machine).findSession(await labelled(wake));
 
     expect(result).toMatchObject({ ok: false, refusal: { reason: "session_label_unreadable", detail: expect.stringContaining("t6c") } });
+    expect(machine.reads).toEqual([]);
     expect(machine.ran).toEqual([]);
   });
 

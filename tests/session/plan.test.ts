@@ -189,7 +189,7 @@ describe("resumes a labelled session through env", () => {
   const BIN = "/home/u/.local/bin/claude";
   let configDir: string;
 
-  async function planLabelled(flags: string[], wakeFlagsExtra: Record<string, unknown> = {}) {
+  async function planLabelled(flags: string[], wakeFlagsExtra: Record<string, unknown> = {}, foregroundProgram: string = BIN) {
     configDir = join(home, ".claude-klock");
     await mkdir(join(configDir, "sessions"), { recursive: true });
     await writeFile(join(configDir, "sessions", `${pid}.json`), registry());
@@ -212,7 +212,7 @@ describe("resumes a labelled session through env", () => {
             argv: ["/home/u/.local/bin/herdr-wake", "shell"],
             status: { state: "done" },
             labels: { wake },
-            foreground: { ...(fixture["foreground"] as object), argv: [BIN] },
+            foreground: { ...(fixture["foreground"] as object), argv: [foregroundProgram] },
           }),
         );
       }
@@ -226,6 +226,12 @@ describe("resumes a labelled session through env", () => {
 
     expect(result.ok && result.plan.resume.argv).toEqual(["env", `CLAUDE_CONFIG_DIR=${configDir}`, BIN, "--resume", SESSION_ID]);
     expect(result.ok && result.plan.session.configDir).toBe(configDir);
+  });
+
+  it("resumes a labelled session through env with the label's program when a wrapper left the bare name in the foreground", async () => {
+    const result = await planLabelled([], {}, "claude");
+
+    expect(result.ok && result.plan.resume.argv).toEqual(["env", `CLAUDE_CONFIG_DIR=${configDir}`, BIN, "--resume", SESSION_ID]);
   });
 
   it("keeping an allowed flag before --resume", async () => {
