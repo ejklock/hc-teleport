@@ -148,6 +148,44 @@ describe("plans a move from the address and the destination", () => {
   });
 });
 
+describe("plans a source that is working", () => {
+  function workingHc(): Hc {
+    return new Hc((_program, args) => {
+      if (args[0] === "get") {
+        return Promise.resolve(JSON.stringify({ ...fixture, address: args[3], argv: ["claude"], status: { state: "working" } }));
+      }
+      return Promise.resolve(JSON.stringify({ machines: listed }));
+    });
+  }
+
+  it("refuses not_idle by default", async () => {
+    const result = await planSession({ terminal: "t6c", machine: "dev-home" }, { hc: workingHc(), home, machines: () => remote });
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "not_idle" } });
+  });
+
+  it("plans it when idleness is not required, leaving every other check in place", async () => {
+    const result = await planSession({ terminal: "t6c", machine: "dev-home" }, { hc: workingHc(), home, machines: () => remote, requireIdle: false });
+    expect(result.ok && result.plan).toMatchObject({ terminal: "t6c", session: { id: SESSION_ID } });
+
+    const unknown = await planSession({ terminal: "t6c", machine: "nowhere" }, { hc: workingHc(), home, machines: () => remote, requireIdle: false });
+    expect(unknown).toMatchObject({ ok: false, refusal: { reason: "unknown_machine" } });
+  });
+
+  it("still refuses terminal_not_running for a finished terminal when idleness is not required", async () => {
+    const finished = new Hc((_program, args) => {
+      if (args[0] === "get") {
+        return Promise.resolve(JSON.stringify({ ...fixture, address: args[3], argv: ["claude"], state: "finished", exit_code: 0 }));
+      }
+      return Promise.resolve(JSON.stringify({ machines: listed }));
+    });
+
+    const result = await planSession({ terminal: "t6c", machine: "dev-home" }, { hc: finished, home, machines: () => remote, requireIdle: false });
+
+    expect(result).toMatchObject({ ok: false, refusal: { reason: "terminal_not_running" } });
+  });
+});
+
 describe("plans a refusal of a move that does not have the Mac at exactly one end", () => {
   it.each([
     ["the Mac to itself", "t6c", "local", "same_machine"],

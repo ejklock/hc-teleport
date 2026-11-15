@@ -14,14 +14,21 @@ A session cannot move itself. `/teleport <machine>` typed into a coding-agent se
 
 ### Scope
 
+
 - Identifying a real session: the herdr-wake `wake` label checked against the pid registry, so a dry-run on a dev-home terminal plans instead of refusing `not_claude`.
 - `hc-teleport init` (an interactive wizard) and `hc-teleport doctor`, with a required config that stores decisions only.
 - The relocation between machines on one disk, the source stopped first.
 - A detached mode: the CLI starts the move in its own `hc` terminal, which outlives the source, waits until the source is idle, then moves; `hc-teleport status` reads the result.
-- The harness plugins (a slash command and a skill per harness), in se-configs, as the last slice.
+- The harness plugins (a slash command and a skill per harness), published by this repository and registered by se-configs, as the last slice.
 - Out: an MCP server; the Mac as a machine of the dev-home core; a self-move from a machine reached over SSH.
 
 ### Decision
+
+
+
+
+
+
 
 
 
@@ -52,6 +59,12 @@ A session cannot move itself. `/teleport <machine>` typed into a coding-agent se
 - **How the relocation proves one disk and reports** (session, 2026-11-14, cheap to change). The plan runs `stat -c %d:%i -- <transcript file>` on the source and on the destination (through `hc exec`, with `--on` for an hc machine) and relocates when both print the same device and inode (`hc exec --on base-digital stat …` and the core's own `stat` both print `39:19323483` for `~/.claude-klock/projects`). The `--dry-run --json` plan gains `"relocate": true` or `false`. The plan refuses `mac_not_an_end` only when the disks differ. On relocation the move runs the read-only preflight, checks the source is idle, stops it, forgets its herdr-wake record when the source is the core's machine, then resumes on the destination; a failed forget is reported in the outcome and does not undo the move. A session resumed by `hc run` gets its own `wake` label from the herdr-wake hooks (`hc get t2s`, started by `hc run claude-bd --resume`, carries one), so a moved session can move again.
 - **herdr-wake forget runs only for a source on the core** (session, 2026-11-14, after the design review; changes the forget bullets above). herdr-wake keeps one record folder, `~/.local/state/herdr-wake/records/<terminal id>.json`, holding only the core's terminals (`t1.json`…`t2y.json`), and `hc exec --on base-digital -- herdr-wake status` prints `0 sessions`; terminal ids repeat across machines (`t12` and `base-digital/t12`). So `herdr-wake forget t12` for `base-digital/t12` would remove the core's `t12` record. The move forgets only when the source is `local`, and reports `forget: "done" | "failed" | "not_recorded"`. Not taken: forgetting on every source (removes another session's record); no forget at all (the core's moved session would come up twice after a reboot).
 - **The relocation runs the preflight before it stops the source** (session, 2026-11-14, after the design review). The preflight only reads, and a destination without the repository, the program or the profile is then refused before anything stops. Not taken: skipping it (a known-bad destination costs a stop and a resume on the source).
+- **How the detached move runs** (session, 2026-11-15, cheap to change; the lock and the first write were later replaced, see "hc's terminal name is the detached move's lock" and "Only the runner that holds the name writes the state file"). `hc-teleport <machine> --detach [--wait <s>] [--json]` reads its own address from `HC_TERMINAL_ID`, prefixed with `HC_SESSION/` when that is set, and drops `HC_SESSION` from the environment of every `hc` call so they reach the core. It checks the config and plans as `--dry-run` would (without the idle refusal), then starts the runner with `hc run` on the core under the name `hct-<session>`, passing the move as arguments, prints the runner's address and the start time, and exits 0, so the agent can end its turn. The runner writes the state file `~/.local/state/hc-teleport/<session id>.json` (phase `waiting`, `moving`, then a final phase), waits for the source to be idle, then moves; a failure is also typed into the source with `hc send`. `hc-teleport status [--json]` prints each state file with its start time, and for a non-final phase whether the runner terminal still lives (`runner_lost`). When the source machine's name is not in `hc machine ls` after dropping `HC_SESSION`, `--detach` refuses `core_unreachable`.
+- **The line typed into the source carries only the phase and the reason** (owner, 2026-11-15, after the design review). `hc send` pastes it into the agent as if the person typed it, and an outcome's detail can hold raw stderr from git, hc or the remote machine (several lines, control sequences, repository file names). The line is `hc-teleport: <phase> (<reason>); see hc-teleport status`, both values from a fixed set the code chooses; the detail stays in the state file. Not taken: the detail collapsed to one line, stripped of control characters and capped; the detail as it is.
+- **A lock whose runner no longer lives is stale** (owner, 2026-11-15, after the design review). When the state file's phase is not final and `hc get` shows its runner gone, as `status` already reports with `runner_lost`, a new `--detach` takes the lock over. Not taken: refusing `move_in_progress` and only naming the file to delete by hand.
+- **hc's terminal name is the detached move's lock** (owner, 2026-11-15, after two reviews of a file lock; replaces the lock and stale-lock parts of the bullets above). The runner starts as `hc run --name hct-<first 28 hex digits of the session id>`. hc refuses a second live terminal of that name (`hc run --name hct-probe-lock` twice: the second prints `{"error":{"kind":"name_taken",…}}`), and frees it once the terminal ends (a run after `hc kill` took the name again), on hc 0.1.21. `name_taken` becomes `move_in_progress`; a dead runner frees the name by itself, so no lock or takeover file and no stale rule remain, and the state file is only a report. Not taken: a lock file with a token and grace periods (each review found new stuck states); proper-lockfile (a dependency for one call).
+- **hc-teleport publishes its own harness plugins** (owner, 2026-11-15, answered in the se-configs session t25 and relayed by it; memory observation 13362). Like active-collab-cli 0.12, this repository ships a Claude Code plugin (a marketplace and a plugin with a `/teleport` command and a skill), a Codex plugin, an OpenCode plugin and a Pi package; se-configs only registers them in `harness/<h>/manifest.json` and bumps its installer to the release with `--detach`. The constraints stand: the skill runs `hc-teleport <machine> --detach` and ends its turn; on `not_initialized` it tells the person to run `hc-teleport init` in a terminal; no MCP server. Not taken: a skill kept in se-configs (a native slash command only on Claude Code and Pi); a new per-harness command render in se-configs (an installer contract change).
+- **Only the runner that holds the name writes the state file** (owner, 2026-11-15, after the third review). The starter passes the move's parameters (session, source, machine, wait, start time) to the runner as arguments and writes nothing; the runner writes the first state as its first act, so a start that loses the name touches no file. Not taken: accepting the window where two concurrent starts could lose the winner's move or overwrite a finished outcome.
 
 ### Open questions
 
@@ -69,8 +82,9 @@ A session cannot move itself. `/teleport <machine>` typed into a coding-agent se
 
 ### Plan
 
+
 - S1: a dry-run plans a real herdr-wake session (label checked against the pid registry) | files: src/session/claude-adapter.ts, src/session/index.ts, src/platform/hc.ts, tests/session/* | after: none
 - S2: `init` wizard, required config, `doctor`, `not_initialized` and `machine_not_allowed` | files: src/config/* (new), src/app/cli.ts, src/move/move.ts, tests/config/*, tests/cli/* | after: S1
 - S3: relocation on one disk, source stopped first, machine to machine allowed | files: src/move/*, src/session/index.ts, tests/move/*, tests/bed/* | after: S2
 - S4: `--detach`, `--wait`, lock, phase file, `status`, failure typed into the source | files: src/detach/* (new), src/app/cli.ts, tests/detach/*, tests/bed/* | after: S3
-- S5: `/teleport` command and skill per harness | files: in se-configs | after: S4 released
+- S5: the harness plugins: a Claude Code marketplace and plugin with `/teleport` and a skill, a Codex plugin, an OpenCode plugin and a Pi package, published by this repository | files: plugins/* (new), package.json, README.md | after: S4; se-configs registers them after the release

@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { configPath, loadConfig, nodeConfigFs, type Config } from "../config/config.ts";
 import { InputEnded, LOCAL, renderDoctor, runDoctor, runInit } from "./init.ts";
+import { detachedMoves, runDetached, sourceAddress, startDetached, type MoveRow } from "../detach/detach.ts";
+import { stateDir, statePath } from "../detach/state.ts";
 import { Hc, HcError } from "../platform/hc.ts";
 import { moveSession, type MoveOutcome } from "../move/index.ts";
 import { shellQuote } from "../move/move.ts";
@@ -15,15 +18,21 @@ const EXIT = { ok: 0, failed: 1, usage: 2, refused: 3, rolledBack: 4 } as const;
 
 const USAGE = [
   "usage: hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]",
+  "       hc-teleport <machine> --detach [--wait <seconds>] [--timeout <seconds>] [--json]",
+  "       hc-teleport status [--json]",
   "       hc-teleport init",
   "       hc-teleport doctor [--json]",
   "  <terminal> is tN on the Mac or <machine>/tN on an hc machine; <machine> is an hc machine, or local for the Mac",
+  "  --detach, from inside a session, starts a terminal that waits for the session to be idle, moves it and reports in status",
   "  init asks which machines may receive a session and stores the answer; doctor checks those machines",
 ].join("\n");
 
 const DEFAULT_TIMEOUT_S = 120;
 const MIN_TIMEOUT_S = 1;
 const MAX_TIMEOUT_S = 600;
+const DEFAULT_WAIT_S = 300;
+const MIN_WAIT_S = 1;
+const MAX_WAIT_S = 3600;
 
 function renderPlan(plan: SessionPlan): string {
   const version = plan.session.version === undefined ? "" : ` (Claude Code ${plan.session.version})`;
@@ -79,6 +88,13 @@ function parseTimeout(text: string | undefined): number | undefined {
   if (!/^\d+$/.test(text)) return undefined;
   const seconds = Number(text);
   return seconds >= MIN_TIMEOUT_S && seconds <= MAX_TIMEOUT_S ? seconds : undefined;
+}
+
+function parseWait(text: string | undefined): number | undefined {
+  if (text === undefined) return DEFAULT_WAIT_S;
+  if (!/^\d+$/.test(text)) return undefined;
+  const seconds = Number(text);
+  return seconds >= MIN_WAIT_S && seconds <= MAX_WAIT_S ? seconds : undefined;
 }
 
 function reportMoved(outcome: Extract<MoveOutcome, { status: "moved" }>, json: boolean): number {
@@ -158,7 +174,14 @@ async function main(args: readonly string[]): Promise<number> {
   try {
     parsed = parseArgs({
       args: [...args],
-      options: { "dry-run": { type: "boolean" }, json: { type: "boolean" }, timeout: { type: "string" } },
+      options: {
+        "dry-run": { type: "boolean" },
+        json: { type: "boolean" },
+        timeout: { type: "string" },
+        detach: { type: "boolean" },
+        wait: { type: "string" },
+        "run-detached": { type: "string" },
+      },
       allowPositionals: true,
       strict: true,
     });
@@ -167,17 +190,43 @@ async function main(args: readonly string[]): Promise<number> {
   }
   const json = parsed.values.json === true;
   try {
-    return await dispatch(parsed.positionals, { dryRun: parsed.values["dry-run"] === true, timeout: parsed.values.timeout, json });
+    return await dispatch(parsed.positionals, {
+      dryRun: parsed.values["dry-run"] === true,
+      timeout: parsed.values.timeout,
+      json,
+      detach: parsed.values.detach === true,
+      wait: parsed.values.wait,
+      runDetached: parsed.values["run-detached"],
+    });
   } catch (error) {
     return failure(error, json);
   }
 }
 
+type Flags = { dryRun: boolean; timeout: string | undefined; json: boolean; detach: boolean; wait: string | undefined; runDetached: string | undefined };
+
+/** The commands of the detached mode (the runner, `status`, `--detach`); nothing when the arguments are for another command. */
+function dispatchDetached(positionals: readonly string[], flags: Flags): Promise<number> | undefined {
+  if (flags.runDetached !== undefined) {
+    return positionals.length === 0 ? runner(flags.runDetached) : Promise.resolve(usageError("--run-detached takes no terminal or machine"));
+  }
+  if (flags.detach) return detachFrom(positionals, flags);
+  if (positionals.length === 1 && positionals[0] === "status") return statusCommand(flags);
+  return flags.wait === undefined ? undefined : Promise.resolve(usageError("--wait only goes with --detach"));
+}
+
+function statusCommand(flags: Flags): Promise<number> {
+  const stray = flags.wait !== undefined ? "--wait" : flags.timeout !== undefined ? "--timeout" : flags.dryRun ? "--dry-run" : undefined;
+  return stray === undefined ? status(flags.json) : Promise.resolve(usageError(`${stray} does not go with status`));
+}
+
 async function dispatch(
   positionals: readonly string[],
-  flags: { dryRun: boolean; timeout: string | undefined; json: boolean },
+  flags: Flags,
 ): Promise<number> {
   const [terminal, machine, ...extra] = positionals;
+  const detached = dispatchDetached(positionals, flags);
+  if (detached !== undefined) return detached;
   if (terminal === "init" && machine === undefined) return init(flags.json);
   if (terminal === "doctor" && machine === undefined) return doctor(flags.json);
   if (terminal === undefined || machine === undefined || extra.length > 0) {
@@ -190,6 +239,22 @@ async function dispatch(
   return teleport({ terminal, machine, timeoutSeconds, dryRun: flags.dryRun, json: flags.json });
 }
 
+async function detachFrom(
+  positionals: readonly string[],
+  flags: { dryRun: boolean; timeout: string | undefined; json: boolean; wait: string | undefined },
+): Promise<number> {
+  const [machine, ...extra] = positionals;
+  if (machine === undefined || extra.length > 0) return usageError("--detach expects exactly <machine>: the session to move is the terminal this runs in");
+  if (flags.dryRun) return usageError("--detach and --dry-run cannot go together");
+  const timeoutSeconds = parseTimeout(flags.timeout);
+  if (timeoutSeconds === undefined) {
+    return usageError(`--timeout takes a whole number of seconds from ${String(MIN_TIMEOUT_S)} to ${String(MAX_TIMEOUT_S)}`);
+  }
+  const waitSeconds = parseWait(flags.wait);
+  if (waitSeconds === undefined) return usageError(`--wait takes a whole number of seconds from ${String(MIN_WAIT_S)} to ${String(MAX_WAIT_S)}`);
+  return await teleportDetached({ machine, timeoutSeconds, waitSeconds, json: flags.json });
+}
+
 type TeleportRequest = { terminal: string; machine: string; timeoutSeconds: number; dryRun: boolean; json: boolean };
 
 async function teleport({ terminal, machine, timeoutSeconds, dryRun, json }: TeleportRequest): Promise<number> {
@@ -199,6 +264,77 @@ async function teleport({ terminal, machine, timeoutSeconds, dryRun, json }: Tel
   const request = { terminal, machine: gated.machine };
   if (dryRun) return showPlan(request, hc, json);
   return report(await moveSession({ ...request, timeoutSeconds }, { hc, run: processRunner(), home: homedir() }), json);
+}
+
+/** From here on every hc call reaches the core: a terminal on an hc machine carries `HC_SESSION`, which would aim them at that machine. */
+function reachCore(): void {
+  delete process.env["HC_SESSION"];
+}
+
+async function teleportDetached({ machine, timeoutSeconds, waitSeconds, json }: { machine: string; timeoutSeconds: number; waitSeconds: number; json: boolean }): Promise<number> {
+  const source = sourceAddress(process.env);
+  if (!source.ok) {
+    return fail({ reason: "not_in_a_terminal", detail: "HC_TERMINAL_ID is not set: --detach moves the session of the hc terminal it runs in" }, json, EXIT.usage);
+  }
+  reachCore();
+  const hc = new Hc();
+  const gated = await gate(machine, hc);
+  if (!gated.ok) return refuse(gated.refusal, json);
+  const started = await startDetached(
+    { source: source.source, ...(source.hcSession === undefined ? {} : { hcSession: source.hcSession }), machine: gated.machine, waitSeconds, timeoutSeconds },
+    {
+      hc,
+      // The session types this command, so it is working; the runner checks idleness again before it stops it.
+      plan: async (terminal, destination) => {
+        const planned = await planSession({ terminal, machine: destination }, { hc, home: homedir(), requireIdle: false });
+        return planned.ok ? { ok: true, session: planned.plan.session.id } : planned;
+      },
+      path: (session) => statePath(process.env, homedir(), session),
+      entry: [process.execPath, fileURLToPath(import.meta.url)],
+      now: Date.now,
+    },
+  );
+  if (started.status === "refused") return refuse(started.refusal, json);
+  const { runner, state } = started;
+  process.stdout.write(
+    json
+      ? `${JSON.stringify({ detached: { runner, source: started.source, machine: started.machine, state } })}\n`
+      : `detached: ${runner} will move ${started.source} to ${started.machine} once it is idle; see hc-teleport status\n`,
+  );
+  return EXIT.ok;
+}
+
+/** The terminal `--detach` started: waits, moves and records, exiting 0 only for a session that moved. */
+async function runner(stateFile: string): Promise<number> {
+  const own = sourceAddress(process.env);
+  reachCore();
+  const hc = new Hc();
+  const run = processRunner();
+  const final = await runDetached(stateFile, {
+    hc,
+    ...(own.ok ? { runner: own.source } : {}),
+    move: (request) => moveSession(request, { hc, run, home: homedir() }),
+    now: Date.now,
+  });
+  const reason = final.outcome?.reason === undefined ? "" : ` (${final.outcome.reason}): ${final.outcome.detail ?? ""}`;
+  process.stdout.write(`hc-teleport: ${final.phase}${reason}\n`);
+  return final.phase === "moved" ? EXIT.ok : EXIT.failed;
+}
+
+function renderRow(row: MoveRow): string {
+  const what = row.session === undefined ? row.file : `${row.session}  ${row.source ?? "?"} -> ${row.machine ?? "?"}`;
+  const runnerNote = row.runner === undefined ? "" : `  runner ${row.runner}`;
+  const lost = row.runner_lost === true ? "  runner_lost" : "";
+  const why = row.reason === undefined ? (row.detail === undefined ? "" : `: ${row.detail}`) : `  ${row.reason}: ${row.detail ?? ""}`;
+  return `${what}  ${row.phase}${lost}${runnerNote}${why}`;
+}
+
+async function status(json: boolean): Promise<number> {
+  reachCore();
+  const moves = await detachedMoves(stateDir(process.env, homedir()), new Hc());
+  if (json) process.stdout.write(`${JSON.stringify({ moves })}\n`);
+  else process.stdout.write(moves.length === 0 ? "no detached moves\n" : `${moves.map(renderRow).join("\n")}\n`);
+  return EXIT.ok;
 }
 
 type Gated = { ok: true; machine: string } | { ok: false; refusal: Reason };

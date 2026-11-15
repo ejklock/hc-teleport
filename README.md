@@ -8,9 +8,26 @@ Moves a coding-agent session that runs in a herdr-core (`hc`) terminal from the 
 
 ```
 hc-teleport <terminal> <machine> [--dry-run] [--timeout <seconds>] [--json]
+hc-teleport <machine> --detach [--wait <seconds>] [--timeout <seconds>] [--json]
+hc-teleport status [--json]
 hc-teleport init
 hc-teleport doctor [--json]
 ```
+
+## A session that moves itself: `--detach` and `status`
+
+`hc-teleport <machine> --detach`, typed from inside the session's own terminal, returns at once so the session can end its turn. It reads its own address from `HC_TERMINAL_ID` (`HC_SESSION/HC_TERMINAL_ID` on an hc machine, where `HC_SESSION` names the machine), checks the config and plans as `--dry-run` would, except that the source may be working, then starts a runner terminal on the core with `hc run`, which outlives the session, named `hct-<first 28 hex digits of the session id>`. It prints one line naming the runner (with `--json`: `{"detached":{"runner","source","machine","state"}}`) and exits 0. Every `hc` call drops `HC_SESSION`, so they reach the core; a machine named by `HC_SESSION` that `hc machine ls` does not list refuses `core_unreachable`, and without `HC_TERMINAL_ID` the command exits 2 with `not_in_a_terminal`.
+
+The runner waits for the source to be idle with `hc wait`, up to `--wait` seconds (a whole number from 1 to 3600, 300 by default; `--timeout` keeps meaning the destination's come-up). A source that works again before it is stopped sends the runner back to waiting. Then it moves the session as the foreground command would. It records the phase in `$XDG_STATE_HOME/hc-teleport/<session id>.json` (`$HOME/.local/state/hc-teleport/` when `XDG_STATE_HOME` is not absolute): `waiting`, `moving`, then the final `moved`, `refused`, `rolled_back`, `rollback_failed`, `source_running`, `source_not_stopped` or `timeout`. The runner records its own terminal address (`HC_TERMINAL_ID`, prefixed with `HC_SESSION/` on an hc machine) in every write. The runner's hc name is the lock: hc refuses a second live terminal of that name, so while the runner lives a second `--detach` for the session refuses `move_in_progress` (naming the runner's name) and starts nothing, and once the runner ends the name is free and a new `--detach` starts. There is no lock file, and the state file only reports the move; `status` shows `runner_lost` for a move that did not end whose runner terminal no longer lives (`hc get`). Any other `hc run` failure refuses `hc_failed`. A malformed file refuses `state_unreadable`. When a move does not end in `moved` and a session still runs, the runner types `hc-teleport: <phase> (<reason>); see hc-teleport status` into it, into the address the session runs on again after a relocation rolled back; the detail is only in the state file and `status`. A failed `hc send` is stored in the file as `sendError`, in the same final write that records the outcome. The reasons a detached move itself gives are in the table below.
+
+| Reason | Phase | When |
+|---|---|---|
+| `wait_timeout` | `timeout` | The source was not idle within `--wait`, or kept working again until then. |
+| `source_gone` | `refused` | The source exited while the runner waited for it. |
+| `source_not_idle` | `refused` | The source is blocked or reports `error` instead of `done` or `idle`. |
+| `runner_failed` | `refused` | `hc` or the move threw in the runner; the detail is the message. |
+
+`hc-teleport status [--json]` (no `--wait`, `--timeout` or `--dry-run`: usage error, exit 2) prints one line per state file: session, source and machine, phase, runner and, for a final phase, the reason. For a phase that is not final it reads the runner with `hc get` and adds `runner_lost` when the runner terminal no longer lives. With no state files it prints `no detached moves`; `--json` prints `{"moves":[...]}`.
 
 ## Setup: `init` and `doctor`
 
@@ -79,7 +96,7 @@ A refusal prints `{"refused":{"reason":"...","detail":"..."}}` on stdout under `
 |---|---|
 | 0 | The session was moved (or, with `--dry-run`, the plan was printed). A source checkout that could not be parked still exits 0. |
 | 1 | `doctor` found a machine that is not ok; `hc` failed, timed out or printed output that is not the expected JSON (`hc_failed`); a local program failed before anything was written (`command_failed`); an unexpected error before anything was written (`unexpected_error`); the rollback itself failed and the error names what is left (`rollback_failed`; a carried move names what is left on the destination, a relocation names what it could not restore: that the session runs nowhere or which destination terminal may still run); a relocation could not stop its source terminal, so nothing was resumed elsewhere (`source_not_stopped`); the destination is confirmed but the source terminal could not be stopped, so both run and nothing is rolled back (`source_running`); or the input ended before every `init` question was answered, and the config is unchanged (`input_ended`). |
-| 2 | Wrong invocation: missing or extra arguments, an unknown option, or a `--timeout` that is not a whole number from 1 to 600. |
+| 2 | Wrong invocation: missing or extra arguments, an unknown option, or a `--timeout` that is not a whole number from 1 to 600; a `--wait` that is not a whole number from 1 to 3600, or one without `--detach`; `--detach` with `--dry-run` or a terminal; `--detach` outside an hc terminal (`not_in_a_terminal`). |
 | 3 | Refused, nothing changed on either side (also `doctor` without a config, and `init` without a terminal). |
 | 4 | Rolled back: the destination did not come up, or a step after the first write failed. The destination is as before; a carried move never touched the source, and a relocation resumed the session on the source again (the message names its new terminal). |
 
@@ -91,6 +108,9 @@ A refusal prints `{"refused":{"reason":"...","detail":"..."}}` on stdout under `
 | `config_unreadable` | The config is not JSON, has a `v` other than 1, or has an `allowed` that is not a list of non-empty strings; the detail names the path. |
 | `machine_not_allowed` | The destination (after the core's name is read as `local`) is not in the config's `allowed` list. |
 | `not_interactive` | `hc-teleport init` ran with stdin not a terminal. |
+| `core_unreachable` | `--detach` ran in a terminal on an hc machine that `hc machine ls` does not list, so the runner could not reach the session. |
+| `move_in_progress` | A detached move of the session has a state file whose phase is not final. |
+| `state_unreadable` | The session's state file is malformed; remove it if no detached move runs. |
 | `terminal_not_running` | The terminal is not live or has exited, or the address is not `tN` or `<machine>/tN`. |
 | `not_idle` | The terminal's status state is not `done` or `idle`, or it has no status. |
 | `unknown_machine` | The source or the destination machine is not in `hc machine ls`. |

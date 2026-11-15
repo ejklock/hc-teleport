@@ -217,6 +217,16 @@ export class Hc {
     return waitOutcome(reply, `hc wait ${address}`);
   }
 
+  /** Pastes `text` into the terminal and presses Enter; hc's reply is not read, so only a failed call is reported. */
+  async send(address: string, text: string): Promise<void> {
+    try {
+      await this.#run("hc", ["send", "--", address, text]);
+    } catch (error) {
+      if (error instanceof ProcessError) throw new HcError(`hc send ${address}: ${error.message}`);
+      throw error;
+    }
+  }
+
   /** Ends the terminal's program and resolves the terminal as hc reports it afterwards. */
   kill(address: string): Promise<HcTerminal> {
     return this.#query(["kill", "--json", "--", address], terminalSchema, `hc kill ${address}`);

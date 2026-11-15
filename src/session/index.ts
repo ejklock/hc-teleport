@@ -111,10 +111,11 @@ function refused(reason: SessionRefusal["reason"], detail: string): PlanResult {
   return { ok: false, refusal: { reason, detail } };
 }
 
-function terminalRefusal(name: string, terminal: HcTerminal): PlanResult | undefined {
+function terminalRefusal(name: string, terminal: HcTerminal, requireIdle: boolean): PlanResult | undefined {
   if (terminal.state !== "live" || terminal.exit_code !== undefined) {
     return refused("terminal_not_running", `${name} is ${terminal.state}`);
   }
+  if (!requireIdle) return undefined;
   const status = terminal.status?.state;
   if (status === undefined || !IDLE_STATES.has(status)) {
     return refused("not_idle", `${name} reports status ${status ?? "none"}, not done or idle`);
@@ -139,19 +140,20 @@ function resumeOf(adapter: AgentAdapter, terminal: HcTerminal, session: AgentSes
  * an hc machine) and the session is read on it; `request.machine` is the
  * destination, where `local` names the Mac. A move needs the Mac at one end unless both machines see the transcript as one file (`relocate`).
  * `deps.home` is the Mac's home; `deps.machines` opens an hc machine by name and
- * defaults to `hc` itself. It only reads: nothing is written, started or stopped.
+ * defaults to `hc` itself. `deps.requireIdle` (default true) set to false skips only the refusal of a source that is
+ * working, for a session that plans its own move while it runs the command. It only reads: nothing is written, started or stopped.
  * Throws `HcError` when `hc` itself fails.
  */
 export async function planSession(
   request: { terminal: string; machine: string },
-  deps: { hc: Hc; home: string; machines?: (name: string) => Machine },
+  deps: { hc: Hc; home: string; machines?: (name: string) => Machine; requireIdle?: boolean },
 ): Promise<PlanResult> {
   const source = sourceOf(request.terminal);
   if (source === undefined) {
     return refused("terminal_not_running", `${JSON.stringify(request.terminal)} is not a terminal address: use tN or <machine>/tN`);
   }
   const terminal = await deps.hc.terminal(request.terminal);
-  const unfit = terminalRefusal(request.terminal, terminal);
+  const unfit = terminalRefusal(request.terminal, terminal, deps.requireIdle ?? true);
   if (unfit !== undefined) return unfit;
 
   const badEnds = endsRefusal(source, request.machine, await deps.hc.machines());

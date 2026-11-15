@@ -453,3 +453,20 @@ describe("keeps the kind of an hc error", () => {
     expect((error as HcError).kind).toBeUndefined();
   });
 });
+
+describe("Hc send", () => {
+  it("types a line into a terminal: pastes the text after the address, with no flags that change when it is typed", async () => {
+    const { run, calls } = recording("");
+    await new Hc(run).send("base-digital/t7", "hc-teleport: timeout (wait_timeout): gave up");
+    expect(calls[0]?.file).toBe("hc");
+    expect(calls[0]?.args).toEqual(["send", "--", "base-digital/t7", "hc-teleport: timeout (wait_timeout): gave up"]);
+  });
+
+  it("types a line into a terminal: names the terminal when hc fails", async () => {
+    const { run } = recording(new ProcessError("hc send", '{"error":{"kind":"not_found"}}'));
+    const failure = await new Hc(run).send("t9", "hello").catch((e: unknown) => e);
+    expect(failure).toBeInstanceOf(HcError);
+    expect((failure as HcError).message).toContain("hc send t9");
+    expect((failure as HcError).kind).toBe("not_found");
+  });
+});
