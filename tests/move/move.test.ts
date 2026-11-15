@@ -873,7 +873,7 @@ describe("relocation rolls back to the source when the destination does not come
 
     const outcome = await relocate();
 
-    expect(outcome).toMatchObject({ status: "rollback_failed", cause: expect.stringContaining("destination_blocked") });
+    expect(outcome).toMatchObject({ status: "rollback_failed", relocated: true, cause: expect.stringContaining("destination_blocked") });
     if (outcome.status !== "rollback_failed") return;
     expect(outcome.left.join(" ")).toContain("runs nowhere");
     expect(outcome.left.join(" ")).toContain(`dev-home: claude --resume ${SESSION_ID}`);
@@ -897,7 +897,7 @@ describe("relocation rolls back to the source when the destination does not come
 
     const outcome = await relocate();
 
-    expect(outcome).toMatchObject({ status: "rollback_failed", cause: expect.stringContaining("destination_blocked") });
+    expect(outcome).toMatchObject({ status: "rollback_failed", relocated: true, cause: expect.stringContaining("destination_blocked") });
     if (outcome.status !== "rollback_failed") return;
     expect(outcome.left.join(" ")).toContain("terminal planet-argon/t1 may still run");
     expect(hc.run).toHaveBeenCalledTimes(1);
