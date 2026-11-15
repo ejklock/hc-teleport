@@ -170,6 +170,7 @@ describe("prints the session plan of an idle Claude terminal", () => {
       session: { id: SESSION_ID, configDir, version: "2.1.321" },
       transcript: { file: join(configDir, "projects", PROJECT_DIR, `${SESSION_ID}.jsonl`), dir: null },
       resume: { argv: ["claude-klock", "--resume", SESSION_ID] },
+      relocate: false,
     });
     expect(run.stdout.trim().split("\n")).toHaveLength(1);
   });
@@ -259,6 +260,7 @@ describe("dry-run of a session that runs on an hc machine", () => {
       session: { id: SESSION_ID, configDir, version: "2.1.321" },
       transcript: { file: join(configDir, "projects", PROJECT_DIR, `${SESSION_ID}.jsonl`), dir: null },
       resume: { argv: ["claude-klock", "--resume", SESSION_ID] },
+      relocate: false,
     });
   });
 
@@ -350,6 +352,7 @@ describe("a move without --dry-run of a session that is not on the Mac", () => {
   });
 
   it("refuses a move with the Mac at neither end with the plan's reason, as --dry-run does", async () => {
+    await registry(join(home, ".claude-klock"));
     const move = await cli("dev-home/t6c", "base-digital", "--json");
 
     expect(move.code).toBe(3);
@@ -763,5 +766,35 @@ describe("doctor from the command line", () => {
 
     expect(run.code).toBe(1);
     expect(JSON.parse(run.stdout).error.reason).toBe("hc_failed");
+  });
+});
+
+describe("dry-run reports whether the session relocates", () => {
+  async function transcript(): Promise<void> {
+    const configDir = join(home, ".claude-klock");
+    await registry(configDir);
+    await mkdir(join(configDir, "projects", PROJECT_DIR), { recursive: true });
+    await writeFile(join(configDir, "projects", PROJECT_DIR, `${SESSION_ID}.jsonl`), "{}\n");
+  }
+
+  it("prints relocate true as JSON and a relocate line when both ends see the transcript as one file", async () => {
+    await transcript();
+
+    const json = await cli("t6c", "dev-home", "--dry-run", "--json");
+    const text = await cli("t6c", "dev-home", "--dry-run");
+
+    expect(json.code).toBe(0);
+    expect((JSON.parse(json.stdout) as { relocate: boolean }).relocate).toBe(true);
+    expect(text.stdout).toMatch(/^relocate\s+true$/m);
+  });
+
+  it("prints relocate false when the destination cannot see the transcript", async () => {
+    await registry(join(home, ".claude-klock"));
+
+    const json = await cli("t6c", "dev-home", "--dry-run", "--json");
+    const text = await cli("t6c", "dev-home", "--dry-run");
+
+    expect((JSON.parse(json.stdout) as { relocate: boolean }).relocate).toBe(false);
+    expect(text.stdout).toMatch(/^relocate\s+false$/m);
   });
 });

@@ -47,6 +47,7 @@ const plan: SessionPlan = {
   session: { id: SESSION_ID, configDir: "/Users/me/.claude", version: "2.1.321" },
   transcript: { file: "/Users/me/.claude/projects/p/s.jsonl", dir: "/Users/me/.claude/projects/p/s" },
   resume: { argv: ["claude", "--resume", SESSION_ID] },
+  relocate: false,
   adapter,
 };
 
@@ -707,5 +708,208 @@ describe("an unexpected error", () => {
 
     expect(await move()).toEqual({ status: "source_running", destination: DEST_ADDRESS, detail: "socket hung up" });
     expect(events.some((event) => event.startsWith("undo"))).toBe(false);
+  });
+});
+
+describe("relocates the session between machines that share a disk", () => {
+  const FROM = "dev-home/t6c";
+  const TO = "planet-argon";
+  const relocation: SessionPlan = {
+    ...plan,
+    terminal: FROM,
+    source: "dev-home",
+    machine: TO,
+    session: { id: SESSION_ID, configDir: "/home/box/.claude", version: "2.1.321" },
+    relocate: true,
+  };
+  const relocate = (terminal = FROM) => moveSession({ terminal, machine: TO, timeoutSeconds: 120 }, deps());
+  const sourceUp = (address: string) =>
+    address === FROM ? { address, state: "live", status: { state: "idle" } } : { address, state: "live", foreground: { pid: 70 } };
+
+  beforeEach(() => {
+    mocks.planSession.mockResolvedValue({ ok: true, plan: relocation });
+    hc.terminal.mockImplementation(async (address: string) => sourceUp(address));
+    hc.run.mockImplementation(async (_argv: string[], options: { on?: string }) => {
+      events.push(`run on ${options.on ?? "local"}`);
+      return `${options.on ?? "local"}/t9`;
+    });
+    hc.exec.mockImplementation(async (argv: string[], options: { on?: string }) => {
+      events.push(`exec ${argv.join(" ")} on ${options.on ?? "local"}`);
+      return { code: 0, stdout: "", stderr: "" };
+    });
+  });
+
+  it("checks the source, stops it, then resumes on the destination with no carry and no park, naming no record it did not forget", async () => {
+    const outcome = await relocate();
+
+    expect(outcome).toEqual({ status: "moved", plan: relocation, relocated: true, destination: "planet-argon/t9", forget: "not_recorded" });
+    expect(events).toEqual([`kill ${FROM}`, "run on planet-argon", "wait"]);
+    expect(hc.run).toHaveBeenCalledWith(relocation.resume.argv, { on: TO, cwd: relocation.cwd, keep: true });
+    expect(confirmResumed).toHaveBeenCalledWith(
+      expect.objectContaining({ address: "planet-argon/t9" }),
+      { sessionId: SESSION_ID, configDir: "/home/box/.claude" },
+      expect.objectContaining({ machine: TO }),
+    );
+    expect(mocks.carryGit).not.toHaveBeenCalled();
+    expect(mocks.carryTranscript).not.toHaveBeenCalled();
+    expect(mocks.parkSource).not.toHaveBeenCalled();
+  });
+
+  it("refuses on the preflight before reading the source, stopping it, forgetting or resuming", async () => {
+    mocks.preflight.mockResolvedValue({ ok: false, refusal: { reason: "dest_unreachable", detail: "no ssh" } });
+
+    const outcome = await relocate();
+
+    expect(outcome).toEqual({ status: "refused", refusal: { reason: "dest_unreachable", detail: "no ssh" } });
+    expect(mocks.preflight).toHaveBeenCalledWith({ plan: relocation, machine: TO }, expect.anything());
+    expect(hc.terminal).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  describe("from the core", () => {
+    const onCore = { ...relocation, terminal: "t6c", source: "local", machine: TO };
+    const fromCore = () => moveSession({ terminal: "t6c", machine: TO, timeoutSeconds: 120 }, deps());
+
+    beforeEach(() => {
+      mocks.planSession.mockResolvedValue({ ok: true, plan: onCore });
+      hc.terminal.mockImplementation(async (address: string) =>
+        address === "t6c" ? { address, state: "live", status: { state: "idle" } } : { address, state: "live", foreground: { pid: 70 } },
+      );
+    });
+
+    it("forgets the record naming no machine, after stopping the source and before resuming", async () => {
+      const outcome = await fromCore();
+
+      expect(outcome).toMatchObject({ status: "moved", relocated: true, destination: "planet-argon/t9", forget: "done" });
+      expect(events).toEqual(["kill t6c", "exec herdr-wake forget t6c on local", "run on planet-argon", "wait"]);
+      expect(hc.exec).toHaveBeenCalledWith(["herdr-wake", "forget", "t6c"], {});
+    });
+
+    it.each([
+      ["a non-zero exit", () => hc.exec.mockResolvedValue({ code: 2, stdout: "", stderr: "no such terminal" }), "no such terminal"],
+      ["an hc error", () => hc.exec.mockRejectedValue(new HcError("hc exec: gone")), "hc exec: gone"],
+    ])("still moves, reporting the forget that failed with %s", async (_title, fail, detail) => {
+      fail();
+
+      const outcome = await fromCore();
+
+      expect(outcome).toMatchObject({ status: "moved", relocated: true, destination: "planet-argon/t9", forget: "failed", forgetDetail: expect.stringContaining(detail) });
+      expect(hc.run).toHaveBeenCalled();
+    });
+  });
+
+  it("refuses with nothing done when the source is no longer idle", async () => {
+    hc.terminal.mockImplementation(async (address: string) => ({ address, state: "live", status: { state: "working" } }));
+
+    const outcome = await relocate();
+
+    expect(outcome).toMatchObject({ status: "refused", refusal: { reason: "source_not_idle" } });
+    expect(events).toEqual([]);
+  });
+
+  it("stops without resuming anywhere when the source cannot be stopped", async () => {
+    hc.kill.mockRejectedValue(new HcError("hc kill: no such terminal"));
+
+    const outcome = await relocate();
+
+    expect(outcome).toEqual({ status: "source_not_stopped", detail: "hc kill: no such terminal" });
+    expect(hc.run).not.toHaveBeenCalled();
+    expect(hc.exec).not.toHaveBeenCalled();
+  });
+});
+
+describe("relocation rolls back to the source when the destination does not come up", () => {
+  const FROM = "dev-home/t6c";
+  const TO = "planet-argon";
+  const relocation: SessionPlan = {
+    ...plan,
+    terminal: FROM,
+    source: "dev-home",
+    machine: TO,
+    session: { id: SESSION_ID, configDir: "/home/box/.claude", version: "2.1.321" },
+    relocate: true,
+  };
+  const relocate = () => moveSession({ terminal: FROM, machine: TO, timeoutSeconds: 120 }, deps());
+  let runs: number;
+
+  beforeEach(() => {
+    runs = 0;
+    mocks.planSession.mockResolvedValue({ ok: true, plan: relocation });
+    hc.terminal.mockImplementation(async (address: string) =>
+      address === FROM ? { address, state: "live", status: { state: "idle" } } : { address, state: "live", foreground: { pid: 70 } },
+    );
+    hc.run.mockImplementation(async (_argv: string[], options: { on?: string }) => {
+      runs += 1;
+      events.push(`run on ${options.on ?? "local"}`);
+      return `${options.on ?? "local"}/t${String(runs)}`;
+    });
+    hc.exec.mockResolvedValue({ code: 0, stdout: "", stderr: "" });
+  });
+
+  it.each<[string, () => void, string]>([
+    ["a timeout", () => (waits = [{ kind: "timeout" }, { kind: "stopped", status: "idle" }]), "destination_timeout"],
+    ["an exit", () => (waits = [{ kind: "exited", code: 1 }, { kind: "stopped", status: "idle" }]), "destination_exited"],
+    ["a blocked terminal", () => (waits = [{ kind: "blocked" }, { kind: "stopped", status: "idle" }]), "destination_blocked"],
+    ["a session it does not confirm", () => confirmResumed.mockResolvedValueOnce({ ok: false, refusal: { reason: "no_session", detail: "x" } }), "not_resumed"],
+  ])("with %s: kills the destination terminal then resumes on the source", async (_title, arrange, reason) => {
+    arrange();
+
+    const outcome = await relocate();
+
+    expect(outcome).toEqual({ status: "rolled_back", reason, detail: expect.any(String), resumedAt: "dev-home/t2" });
+    expect(events.filter((event) => event.startsWith("run") || event.startsWith("kill"))).toEqual([
+      `kill ${FROM}`,
+      "run on planet-argon",
+      "kill planet-argon/t1",
+      "run on dev-home",
+    ]);
+    expect(hc.run).toHaveBeenLastCalledWith(relocation.resume.argv, { on: "dev-home", cwd: relocation.cwd, keep: true });
+    expect(mocks.carryGit).not.toHaveBeenCalled();
+    expect(mocks.parkSource).not.toHaveBeenCalled();
+  });
+
+  it("names the machine and the resume command when the source does not come up either", async () => {
+    waits = [{ kind: "blocked" }, { kind: "blocked" }];
+
+    const outcome = await relocate();
+
+    expect(outcome).toMatchObject({ status: "rollback_failed", cause: expect.stringContaining("destination_blocked") });
+    if (outcome.status !== "rollback_failed") return;
+    expect(outcome.left.join(" ")).toContain("runs nowhere");
+    expect(outcome.left.join(" ")).toContain(`dev-home: claude --resume ${SESSION_ID}`);
+  });
+
+  it("quotes the resume command it names", async () => {
+    mocks.planSession.mockResolvedValue({ ok: true, plan: { ...relocation, resume: { argv: ["env", "CLAUDE_CONFIG_DIR=/a b/.claude", "claude", "--resume", SESSION_ID] } } });
+    waits = [{ kind: "blocked" }, { kind: "blocked" }];
+
+    const outcome = await relocate();
+
+    expect(outcome.status === "rollback_failed" && outcome.left.join(" ")).toContain(`env 'CLAUDE_CONFIG_DIR=/a b/.claude' claude --resume ${SESSION_ID}`);
+  });
+
+  it("names the destination terminal that may still run when it cannot be stopped, and does not resume on the source", async () => {
+    waits = [{ kind: "blocked" }];
+    hc.kill.mockImplementation(async (address: string) => {
+      events.push(`kill ${address}`);
+      if (address === "planet-argon/t1") throw new HcError("hc kill: gone");
+    });
+
+    const outcome = await relocate();
+
+    expect(outcome).toMatchObject({ status: "rollback_failed", cause: expect.stringContaining("destination_blocked") });
+    if (outcome.status !== "rollback_failed") return;
+    expect(outcome.left.join(" ")).toContain("terminal planet-argon/t1 may still run");
+    expect(hc.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not stop a destination terminal that never started, then resumes on the source", async () => {
+    hc.run.mockRejectedValueOnce(new HcError("hc run: refused")).mockResolvedValueOnce("dev-home/t2");
+
+    const outcome = await relocate();
+
+    expect(outcome).toEqual({ status: "rolled_back", reason: "hc_failed", detail: "hc run: refused", resumedAt: "dev-home/t2" });
+    expect(hc.kill.mock.calls).toEqual([[FROM]]);
+    expect(hc.run).toHaveBeenLastCalledWith(relocation.resume.argv, { on: "dev-home", cwd: relocation.cwd, keep: true });
   });
 });

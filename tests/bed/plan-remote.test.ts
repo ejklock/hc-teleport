@@ -76,6 +76,7 @@ describe("hc-teleport plans a move to the Mac of a session that runs on dest, th
       session: { id: session.id, configDir: session.configDir, version: "2.1.321" },
       transcript: { file: `${session.project}/${session.id}.jsonl`, dir: `${session.project}/${session.id}` },
       resume: { argv: [launcher, "--resume", session.id] },
+      relocate: false,
     });
   });
 

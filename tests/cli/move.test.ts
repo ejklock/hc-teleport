@@ -159,6 +159,28 @@ describe("moves the session from the command line", () => {
     expect(run.stderr).toContain("refs/hc-teleport/x/head");
   });
 
+  it("prints what is left on the destination when a carried move's rollback failed", async () => {
+    outcomes({ status: "rollback_failed", cause: "destination_blocked: stuck", left: ["terminal dev-home/t7 still runs"] });
+
+    const run = await cli("t6c", "dev-home", "--json");
+
+    const { error } = JSON.parse(run.stdout) as { error: { detail: string; cause: string; left: string[] } };
+    expect(error.detail).toBe("destination_blocked: stuck; left on the destination: terminal dev-home/t7 still runs");
+    expect(error.cause).toBe("destination_blocked: stuck");
+    expect(error.left).toEqual(["terminal dev-home/t7 still runs"]);
+    expect(run.stderr).toContain("; left on the destination: terminal dev-home/t7 still runs");
+  });
+
+  it("prints what is left without naming the destination when a relocation's rollback failed", async () => {
+    outcomes({ status: "rollback_failed", relocated: true, cause: "destination_blocked: stuck", left: ["the session runs nowhere"] });
+
+    const run = await cli("t6c", "dev-home", "--json");
+
+    const { error } = JSON.parse(run.stdout) as { error: { detail: string; cause: string; left: string[] } };
+    expect(error.detail).toBe("destination_blocked: stuck; left: the session runs nowhere");
+    expect(error.left).toEqual(["the session runs nowhere"]);
+  });
+
   it("exits 1 naming the destination and saying the source still runs when it could not be stopped", async () => {
     outcomes({ status: "source_running", destination: "dev-home/t7", detail: "hc kill: boom" });
 

@@ -20,16 +20,25 @@ export type MoveDeps = {
 };
 
 type Reason = { reason: string; detail: string };
+export type Forget = "done" | "failed" | "not_recorded";
 
 export type MoveOutcome =
   /** The destination runs the session and the source is stopped; `parked` says whether the source checkout was reset. */
-  | { status: "moved"; plan: SessionPlan; destination: string; parked: Parked }
+  | { status: "moved"; plan: SessionPlan; destination: string; parked: Parked; relocated?: undefined }
+  /**
+   * A session on a disk both machines share was stopped on the source and resumed on the destination. `forget` is
+   * `done` when the core's herdr-wake record was removed, `failed` (with `forgetDetail`) when removing it did not
+   * work, and `not_recorded` for a source on an hc machine, which herdr-wake does not record.
+   */
+  | { status: "moved"; plan: SessionPlan; relocated: true; destination: string; forget: Forget; forgetDetail?: string }
+  /** A relocation could not stop the source terminal, so nothing was resumed elsewhere. */
+  | { status: "source_not_stopped"; detail: string }
   /** Nothing changed on either side. */
   | ({ status: "refused" } & { refusal: Reason })
-  /** The destination did not come up and was put back as it was; the source was never touched. */
-  | ({ status: "rolled_back" } & Reason)
-  /** The destination did not come up and the rollback failed; `left` names what stays on the destination. */
-  | { status: "rollback_failed"; cause: string; left: string[] }
+  /** The destination did not come up and was put back as it was; a carried move never touched the source, and a relocation resumed the session on the source again as `resumedAt`. */
+  | ({ status: "rolled_back"; resumedAt?: string } & Reason)
+  /** The destination did not come up and the rollback failed; `left` names what stays on the destination, or for a relocation (`relocated`) what the source and destination may still run. */
+  | { status: "rollback_failed"; cause: string; left: string[]; relocated?: true }
   /** The destination runs the session but the source terminal could not be stopped, so both run. */
   | { status: "source_running"; destination: string; detail: string };
 
@@ -57,12 +66,13 @@ class DidNotComeUp extends Error {
 type Written = { git: Carried; transcript?: TranscriptCarried; address?: string };
 
 /**
- * Moves the planned session: checks everything, carries git then the transcript, resumes the session on the
+ * Moves the planned session: checks everything, then carries git and the transcript, resumes the session on the
  * destination and waits until it is idle there, confirms the destination registry names the session, then stops the
  * source terminal and parks the source checkout. A refusal before the first write changes nothing. A destination
  * that does not come up, or a step failing after the first write, is rolled back (destination terminal, transcript,
  * git) and never touches the source; so does a source that, read again right before it is stopped, is no longer idle.
- * Throws only for a failure before the first write.
+ * Two machines that share the session's disk take a different path: the same checks, then the source is stopped
+ * and the session resumed on the destination (see `relocateSession`). Throws only for a failure before the first write.
  */
 export async function moveSession(
   request: { terminal: string; machine: string; timeoutSeconds: number },
@@ -74,6 +84,7 @@ export async function moveSession(
   const { plan } = planned;
   const checked = await preflight({ plan, machine }, { hc: deps.hc, run: deps.run, adapter: plan.adapter });
   if (!checked.ok) return { status: "refused", refusal: checked.refusal };
+  if (plan.relocate) return relocateSession(plan, request.timeoutSeconds, deps);
 
   const source = remoteSource(plan);
   const sourceHome = source === undefined ? deps.home : await new HcMachine(source, deps.hc).home();
@@ -103,6 +114,113 @@ export async function moveSession(
     return { status: "source_running", destination, detail: messageOf(error) };
   }
   return { status: "moved", plan, destination, parked: await park(git, deps) };
+}
+
+/**
+ * Moves a session between machines that share its disk, after the preflight: nothing is carried or parked. The
+ * source is checked idle and stopped; the core's herdr-wake record is forgotten (a failed forget is reported, not
+ * undone); then the session resumes on the destination, and on the source again when the destination does not come up.
+ */
+async function relocateSession(plan: SessionPlan, timeoutSeconds: number, deps: MoveDeps): Promise<MoveOutcome> {
+  try {
+    await requireSourceIdle(plan.terminal, deps.hc);
+  } catch (error) {
+    return error instanceof DidNotComeUp
+      ? { status: "refused", refusal: { reason: error.reason, detail: error.message } }
+      : { status: "refused", refusal: describe(error) };
+  }
+  try {
+    await deps.hc.kill(plan.terminal);
+  } catch (error) {
+    return { status: "source_not_stopped", detail: messageOf(error) };
+  }
+  const forgot = await forgetRecord(plan, deps);
+
+  const configDir = plan.session.configDir;
+  let started: string | undefined;
+  try {
+    const destination = await resumeOn(plan, { machine: plan.machine, configDir, timeoutSeconds, onStarted: (address) => void (started = address) }, deps);
+    return { status: "moved", plan, relocated: true, destination, ...forgot };
+  } catch (error) {
+    return backToSource(plan, { cause: error, started, timeoutSeconds }, deps);
+  }
+}
+
+/**
+ * Removes the core terminal's herdr-wake record so a reboot does not resume the session there too. herdr-wake keeps
+ * one record folder holding only the core's terminals, and terminal ids repeat across machines, so a source on an
+ * hc machine is never forgotten.
+ */
+async function forgetRecord(plan: SessionPlan, deps: MoveDeps): Promise<{ forget: Forget; forgetDetail?: string }> {
+  if (remoteSource(plan) !== undefined) return { forget: "not_recorded" };
+  try {
+    const result = await deps.hc.exec(["herdr-wake", "forget", plan.terminal], {});
+    if (result.code === 0) return { forget: "done" };
+    return { forget: "failed", forgetDetail: `herdr-wake forget ${plan.terminal} exited ${result.code}: ${result.stderr.trim()}` };
+  } catch (error) {
+    return { forget: "failed", forgetDetail: messageOf(error) };
+  }
+}
+
+/** The destination did not come up: stops its terminal, then resumes the session on the source machine again. */
+async function backToSource(
+  plan: SessionPlan,
+  failure: { cause: unknown; started: string | undefined; timeoutSeconds: number },
+  deps: MoveDeps,
+): Promise<MoveOutcome> {
+  const { cause, started, timeoutSeconds } = failure;
+  const reason = describe(cause);
+  const machine = plan.source ?? "local";
+  const command = plan.resume.argv.map(shellQuote).join(" ");
+  const stranded = `the session runs nowhere; resume it on ${machine}: ${command}`;
+  if (started !== undefined) {
+    const address = started;
+    try {
+      await deps.hc.kill(address);
+    } catch (error) {
+      return {
+        status: "rollback_failed",
+        relocated: true,
+        cause: `${reason.reason}: ${reason.detail}`,
+        left: [`terminal ${address} may still run (${messageOf(error)}); if it does not, ${stranded}`],
+      };
+    }
+  }
+  try {
+    const resumedAt = await resumeOn(plan, { machine, configDir: plan.session.configDir, timeoutSeconds, onStarted: () => undefined }, deps);
+    return { status: "rolled_back", ...reason, resumedAt };
+  } catch (error) {
+    return { status: "rollback_failed", relocated: true, cause: `${reason.reason}: ${reason.detail}`, left: [`${stranded} (${messageOf(error)})`] };
+  }
+}
+
+/** Quotes one word for a shell command line shown to a person. */
+export function shellQuote(token: string): string {
+  return /^[\w@%+=:,./-]+$/.test(token) ? token : `'${token.replaceAll("'", `'\\''`)}'`;
+}
+
+/** Resumes the plan's session on a machine, waits until it is idle and confirms it; resolves with the new terminal. */
+async function resumeOn(
+  plan: SessionPlan,
+  target: { machine: string; configDir: string; timeoutSeconds: number; onStarted: (address: string) => void },
+  deps: MoveDeps,
+): Promise<string> {
+  const { machine, configDir, timeoutSeconds, onStarted } = target;
+  const { hc } = deps;
+  // hc runs on the Mac when no machine is named, with the PATH its terminals start with; `local` is never a name it knows.
+  const place = machine === "local" ? {} : { on: machine };
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  const address = await hc.run(plan.resume.argv, { ...place, cwd: plan.cwd, keep: true });
+  onStarted(address);
+  await waitUntilStopped(hc, address, deadline);
+  const remote: RemoteRun = { machine, run: (argv) => hc.exec(argv, place) };
+  const confirmed = await plan.adapter.confirmResumed(
+    await terminalWithForeground(hc, address, deadline),
+    { sessionId: plan.session.id, configDir },
+    remote,
+  );
+  if (!confirmed.ok) throw new DidNotComeUp("not_resumed", `${confirmed.refusal.reason}: ${confirmed.refusal.detail}`);
+  return address;
 }
 
 /** The hc machine the session moves from, or nothing when it runs on the Mac. */
@@ -140,11 +258,8 @@ async function comeUp(
   written: Written,
   deps: MoveDeps,
 ): Promise<string> {
-  const { hc } = deps;
   const { dest } = ends;
   const source = remoteSource(plan);
-  // hc runs on the Mac when no machine is named, with the PATH its terminals start with; `local` is never a name it knows.
-  const place = plan.machine === "local" ? {} : { on: plan.machine };
   written.transcript = await carryTranscript(
     {
       machine: plan.machine,
@@ -155,21 +270,13 @@ async function comeUp(
       destConfigDir: dest.configDir,
       destHome: dest.home,
     },
-    { hc },
+    { hc: deps.hc },
   );
-  const deadline = Date.now() + timeoutSeconds * 1000;
-  const address = await hc.run(plan.resume.argv, { ...place, cwd: plan.cwd, keep: true });
-  written.address = address;
-  await waitUntilStopped(hc, address, deadline);
-
-  const remote: RemoteRun = { machine: plan.machine, run: (argv) => hc.exec(argv, place) };
-  const confirmed = await plan.adapter.confirmResumed(
-    await terminalWithForeground(hc, address, deadline),
-    { sessionId: plan.session.id, configDir: dest.configDir },
-    remote,
+  return resumeOn(
+    plan,
+    { machine: plan.machine, configDir: dest.configDir, timeoutSeconds, onStarted: (address) => void (written.address = address) },
+    deps,
   );
-  if (!confirmed.ok) throw new DidNotComeUp("not_resumed", `${confirmed.refusal.reason}: ${confirmed.refusal.detail}`);
-  return address;
 }
 
 const FOREGROUND_POLL_MS = 250;

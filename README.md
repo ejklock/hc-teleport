@@ -2,7 +2,7 @@
 
 Moves a coding-agent session that runs in a herdr-core (`hc`) terminal from the Mac to another `hc` machine. It also moves a session back, from an `hc` machine to the Mac. The design and plan live in `docs/issues/0001-move-a-claude-code-session-between-the-mac-and-dev-home-from-an-hc-terminal.md`.
 
-`hc-teleport <terminal> <machine>` moves the session. In order it plans, checks the destination (preflight), carries the git checkout, carries the transcript, resumes the session in a new terminal on the destination and waits until it is idle there, confirms the destination's session registry names the session, then stops the source terminal and parks the source checkout. A refusal before the first write changes nothing on either side; a destination that does not come up is rolled back and the source is never touched. `--dry-run` only plans: it reads the terminal and prints what a move would resume, and writes nothing, starts nothing and stops nothing.
+`hc-teleport <terminal> <machine>` moves the session. In order it plans, checks the destination (preflight), then, for a session on a disk both machines share, relocates it (below); otherwise it carries the git checkout, carries the transcript, resumes the session in a new terminal on the destination and waits until it is idle there, confirms the destination's session registry names the session, then stops the source terminal and parks the source checkout. A refusal before the first write changes nothing on either side; a destination that does not come up is rolled back and, for a carried move, the source is never touched. `--dry-run` only plans: it reads the terminal and prints what a move would resume, and writes nothing, starts nothing and stops nothing.
 
 ## Usage
 
@@ -26,7 +26,7 @@ The config is `$XDG_CONFIG_HOME/hc-teleport/config.json` when `XDG_CONFIG_HOME` 
 
 `<machine>` in a move is checked against the config: a name equal to the core's name means `local`, unless `hc machine ls` lists a machine of that name.
 
-`--timeout` is how long the move waits for the resumed session to be idle on the destination: a whole number of seconds from 1 to 600, 120 by default. Run it on the Mac. `<terminal>` is an `hc` terminal address: `t6c` for a terminal on the Mac, `dev-home/t6c` for one on the `hc` machine `dev-home`. `<machine>` is the destination: a name from `hc machine ls`, or `local` for the Mac, which `hc machine ls` never lists. A move has the Mac at exactly one end, so `hc-teleport dev-home/t6c local` is the way back: it reads the session on `dev-home` through `hc`, carries git and the transcript to the Mac, resumes the session in a new terminal on the Mac, then stops the terminal on `dev-home` and parks its checkout there; with `--dry-run` it only plans that. It needs Node 26 (`.nvmrc`) and `hc` on the PATH.
+`--timeout` is how long the move waits for the resumed session to be idle on the destination: a whole number of seconds from 1 to 600, 120 by default. Run it on the Mac. `<terminal>` is an `hc` terminal address: `t6c` for a terminal on the Mac, `dev-home/t6c` for one on the `hc` machine `dev-home`. `<machine>` is the destination: a name from `hc machine ls`, or `local` for the Mac, which `hc machine ls` never lists. A move has the Mac at one end unless the two machines share the session's disk (see the relocation below), so `hc-teleport dev-home/t6c local` is the way back: it reads the session on `dev-home` through `hc`, carries git and the transcript to the Mac, resumes the session in a new terminal on the Mac, then stops the terminal on `dev-home` and parks its checkout there; with `--dry-run` it only plans that. It needs Node 26 (`.nvmrc`) and `hc` on the PATH.
 
 The session is found from the terminal itself. For Claude Code, the config directory comes from `<launcher> --where` (a plain `claude` uses `~/.claude`), and `<configDir>/sessions/<foreground pid>.json` names the session id. That file is internal to Claude Code and undocumented, so an unknown shape refuses.
 
@@ -50,9 +50,16 @@ Without `--json` the plan (`--dry-run`) or a line naming the destination termina
   "cwd": "/Volumes/Developer/www/klock-tecnologia/hc-teleport",
   "session": { "id": "09e11b42-f5c1-4c38-99f1-dd1d8b00355c", "configDir": "/Users/me/.claude-klock", "version": "2.1.321" },
   "transcript": { "file": "/Users/me/.claude-klock/projects/-Volumes-...-hc-teleport/09e11b42-....jsonl", "dir": null },
-  "resume": { "argv": ["claude-klock", "--model", "opus", "--resume", "09e11b42-f5c1-4c38-99f1-dd1d8b00355c"] }
+  "resume": { "argv": ["claude-klock", "--model", "opus", "--resume", "09e11b42-f5c1-4c38-99f1-dd1d8b00355c"] },
+  "relocate": false
 }
 ```
+
+`relocate` is `true` when the source and the destination machine both print the same `<device>:<inode>` for `stat -c %d:%i -- <transcript file>`: the two see one disk. The plain plan prints it as a `relocate` line.
+
+### Relocation
+
+A move whose plan says `relocate: true` copies nothing. It runs the same preflight first (a refusal changes nothing), then checks the source terminal is still idle (`source_not_idle` refuses, nothing done) and stops it. When the source is on the core (`local`, no `--on`) it runs `herdr-wake forget <tN>` there to remove its record; herdr-wake keeps one record folder holding only the core's terminals and terminal ids repeat across machines, so for a source on an `hc` machine nothing runs. The outcome's `forget` is `done`, `failed` (the move still succeeds, with a stderr line saying the session may be resumed twice after a reboot and naming `herdr-wake forget <tN>`) or `not_recorded` (a source on an `hc` machine, no stderr line). It then resumes the session on the destination and waits until it is idle there. It never carries git or the transcript and never parks. Two machines on one disk may move directly, without the Mac at either end; on different disks the Mac stays at one end (`mac_not_an_end`). When the destination does not come up, its terminal is stopped and the session resumes on the source machine again (`rolled_back`, exit 4, with `resumedAt` naming the new source terminal); when that also fails, or the destination terminal cannot be stopped, the outcome is `rollback_failed` (exit 1), `left` says the session runs nowhere or which terminal may still run, and gives the machine and the resume command. A relocated move prints `{ "moved": { ..., "relocated": true, "forget": "done" } }` with no `parked`. `source_not_stopped` (exit 1) means the source terminal could not be stopped and nothing was resumed elsewhere.
 
 A session on an `hc` machine adds `"source": "dev-home"` (the machine it runs on) to this object; a session on the Mac prints without it, and `machine` is always the destination. The config directory, registry and transcript paths are read on the source. `session.version` is left out when the registry does not carry it. `transcript.dir` is the sibling `<sessionId>/` directory (it holds `subagents/`), or `null` when the session has none.
 
@@ -71,10 +78,10 @@ A refusal prints `{"refused":{"reason":"...","detail":"..."}}` on stdout under `
 | Code | Meaning |
 |---|---|
 | 0 | The session was moved (or, with `--dry-run`, the plan was printed). A source checkout that could not be parked still exits 0. |
-| 1 | `doctor` found a machine that is not ok; `hc` failed, timed out or printed output that is not the expected JSON (`hc_failed`); a local program failed before anything was written (`command_failed`); an unexpected error before anything was written (`unexpected_error`); the rollback itself failed and the error names what is left on the destination (`rollback_failed`); the destination is confirmed but the source terminal could not be stopped, so both run and nothing is rolled back (`source_running`); or the input ended before every `init` question was answered, and the config is unchanged (`input_ended`). |
+| 1 | `doctor` found a machine that is not ok; `hc` failed, timed out or printed output that is not the expected JSON (`hc_failed`); a local program failed before anything was written (`command_failed`); an unexpected error before anything was written (`unexpected_error`); the rollback itself failed and the error names what is left (`rollback_failed`; a carried move names what is left on the destination, a relocation names what it could not restore: that the session runs nowhere or which destination terminal may still run); a relocation could not stop its source terminal, so nothing was resumed elsewhere (`source_not_stopped`); the destination is confirmed but the source terminal could not be stopped, so both run and nothing is rolled back (`source_running`); or the input ended before every `init` question was answered, and the config is unchanged (`input_ended`). |
 | 2 | Wrong invocation: missing or extra arguments, an unknown option, or a `--timeout` that is not a whole number from 1 to 600. |
 | 3 | Refused, nothing changed on either side (also `doctor` without a config, and `init` without a terminal). |
-| 4 | Rolled back: the destination did not come up, or a step after the first write failed. The destination is as before and the source was not touched. |
+| 4 | Rolled back: the destination did not come up, or a step after the first write failed. The destination is as before; a carried move never touched the source, and a relocation resumed the session on the source again (the message names its new terminal). |
 
 ## Refusal reasons (exit 3)
 
@@ -89,7 +96,7 @@ A refusal prints `{"refused":{"reason":"...","detail":"..."}}` on stdout under `
 | `unknown_machine` | The source or the destination machine is not in `hc machine ls`. |
 | `machine_unreachable` | The source or the destination machine is listed but not connected. |
 | `same_machine` | The terminal runs on the machine it would move to (`t6c local`, `dev-home/t6c dev-home`). |
-| `mac_not_an_end` | Neither end is the Mac (`dev-home/t6c vps`); a move goes between the Mac and one `hc` machine. |
+| `mac_not_an_end` | Neither end is the Mac (`dev-home/t6c vps`) and the two machines do not share the session's disk; otherwise a move goes between the Mac and one `hc` machine. |
 | `local_name_taken` | `hc machine ls` lists a machine named `local`, the name hc-teleport uses for the Mac; rename it with `hc machine rename`. |
 | `not_claude` | The name of the terminal's foreground program (its basename) is not `claude`. |
 | `session_label_unreadable` | The `wake` label is not JSON, has a `v` other than 1, an `agent` other than `claude`, no `bin`, `session_id` or `agent_proc.pid`, no absolute `env.CLAUDE_CONFIG_DIR`, or a `bin` that is not an absolute path to the foreground program (the foreground may show the bare program name a wrapper leaves behind). |

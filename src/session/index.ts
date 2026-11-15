@@ -13,6 +13,8 @@ export type SessionPlan = {
   session: { id: string; configDir: string; version?: string };
   transcript: { file: string; dir?: string };
   resume: { argv: readonly string[] };
+  /** True when both machines see the transcript file as one file-system object, so a move needs no carry. */
+  relocate: boolean;
   /** The adapter that recognized the terminal, for the checks that follow the plan. */
   adapter: AgentAdapter;
 };
@@ -78,10 +80,31 @@ function endsRefusal(source: string, destination: string, listed: readonly HcLis
     return refused("local_name_taken", `hc lists a machine named ${MAC}, which hc-teleport reserves for the Mac`);
   }
   if (source === destination) return refused("same_machine", `${source} is both the source and the destination`);
-  if (source !== MAC && destination !== MAC) {
-    return refused("mac_not_an_end", `${source} to ${destination} has the Mac at neither end`);
-  }
   return endRefusal(source, listed) ?? endRefusal(destination, listed);
+}
+
+const DEVICE_AND_INODE = /^\d+:\d+\n$/;
+
+/** What a machine reports for a file as `<device>:<inode>`, or nothing when it cannot say. */
+async function identityOn(machine: Machine, file: string): Promise<string | undefined> {
+  try {
+    const printed = await machine.exec(["stat", "-c", "%d:%i", "--", file]);
+    return printed.code === 0 && DEVICE_AND_INODE.test(printed.stdout) ? printed.stdout.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when both machines print the same device and inode for the file: one disk, so the file needs no copy. */
+async function sharesDisk(source: Machine, destination: Machine, file: string): Promise<boolean> {
+  const [from, to] = await Promise.all([identityOn(source, file), identityOn(destination, file)]);
+  return from !== undefined && from === to;
+}
+
+/** A move with the Mac at neither end is only allowed when the two machines share the session's disk. */
+function diskRefusal(source: string, destination: string, relocate: boolean): PlanResult | undefined {
+  if (relocate || source === MAC || destination === MAC) return undefined;
+  return refused("mac_not_an_end", `${source} to ${destination} has the Mac at neither end and the two do not share the session's disk`);
 }
 
 function refused(reason: SessionRefusal["reason"], detail: string): PlanResult {
@@ -114,7 +137,7 @@ function resumeOf(adapter: AgentAdapter, terminal: HcTerminal, session: AgentSes
  * Reads the terminal and the machines through `hc`, then works out what a move
  * would resume. The terminal address names the source (`tN` the Mac, `<machine>/tN`
  * an hc machine) and the session is read on it; `request.machine` is the
- * destination, where `local` names the Mac. A move needs the Mac at exactly one end.
+ * destination, where `local` names the Mac. A move needs the Mac at one end unless both machines see the transcript as one file (`relocate`).
  * `deps.home` is the Mac's home; `deps.machines` opens an hc machine by name and
  * defaults to `hc` itself. It only reads: nothing is written, started or stopped.
  * Throws `HcError` when `hc` itself fails.
@@ -145,6 +168,9 @@ export async function planSession(
   if (!resume.ok) return resume;
 
   const { id, configDir, version, transcript } = found.session;
+  const relocate = await sharesDisk(machineNamed(source, deps), machineNamed(request.machine, deps), transcript.file);
+  const apart = diskRefusal(source, request.machine, relocate);
+  if (apart !== undefined) return apart;
   return {
     ok: true,
     plan: {
@@ -155,6 +181,7 @@ export async function planSession(
       session: { id, configDir, ...(version === undefined ? {} : { version }) },
       transcript,
       resume: { argv: resume.argv },
+      relocate,
       adapter,
     },
   };

@@ -6,6 +6,7 @@ import { configPath, loadConfig, nodeConfigFs, type Config } from "../config/con
 import { InputEnded, LOCAL, renderDoctor, runDoctor, runInit } from "./init.ts";
 import { Hc, HcError } from "../platform/hc.ts";
 import { moveSession, type MoveOutcome } from "../move/index.ts";
+import { shellQuote } from "../move/move.ts";
 import { MachineError } from "../platform/machine.ts";
 import { ProcessError, processRunner } from "../platform/process.ts";
 import { planSession, type SessionPlan } from "../session/index.ts";
@@ -24,10 +25,6 @@ const DEFAULT_TIMEOUT_S = 120;
 const MIN_TIMEOUT_S = 1;
 const MAX_TIMEOUT_S = 600;
 
-function shellQuote(token: string): string {
-  return /^[\w@%+=:,./-]+$/.test(token) ? token : `'${token.replaceAll("'", `'\\''`)}'`;
-}
-
 function renderPlan(plan: SessionPlan): string {
   const version = plan.session.version === undefined ? "" : ` (Claude Code ${plan.session.version})`;
   return [
@@ -40,6 +37,7 @@ function renderPlan(plan: SessionPlan): string {
     `transcript  ${plan.transcript.file}`,
     `subagents   ${plan.transcript.dir ?? "none"}`,
     `resume      ${plan.resume.argv.map(shellQuote).join(" ")}`,
+    `relocate    ${String(plan.relocate)}`,
   ].join("\n");
 }
 
@@ -53,6 +51,7 @@ function jsonPlan(plan: SessionPlan): unknown {
     session: plan.session,
     transcript: { file: plan.transcript.file, dir: plan.transcript.dir ?? null },
     resume: plan.resume,
+    relocate: plan.relocate,
   };
 }
 
@@ -82,33 +81,47 @@ function parseTimeout(text: string | undefined): number | undefined {
   return seconds >= MIN_TIMEOUT_S && seconds <= MAX_TIMEOUT_S ? seconds : undefined;
 }
 
+function reportMoved(outcome: Extract<MoveOutcome, { status: "moved" }>, json: boolean): number {
+  if (outcome.relocated === true) return reportRelocated(outcome, json);
+  const { plan, destination, parked } = outcome;
+  process.stdout.write(
+    json
+      ? `${JSON.stringify({ moved: { terminal: plan.terminal, machine: plan.machine, session: plan.session.id, destination, parked } })}\n`
+      : `moved ${plan.terminal} to ${destination} (session ${plan.session.id}); source terminal stopped\n`,
+  );
+  process.stderr.write(
+    parked.parked
+      ? `hc-teleport: source checkout parked under refs/hc-teleport/${plan.session.id}/\n`
+      : `hc-teleport: source checkout not parked: ${parked.reason}\n`,
+  );
+  return EXIT.ok;
+}
+
+function reportRolledBack(outcome: Extract<MoveOutcome, { status: "rolled_back" }>, json: boolean): number {
+  const rolledBack = { reason: outcome.reason, detail: outcome.detail, ...(outcome.resumedAt === undefined ? {} : { resumedAt: outcome.resumedAt }) };
+  if (json) process.stdout.write(`${JSON.stringify({ rolledBack })}\n`);
+  const where = outcome.resumedAt === undefined ? "the source was not touched" : `the session runs again on the source as ${outcome.resumedAt}`;
+  process.stderr.write(`hc-teleport: rolled back (${rolledBack.reason}): ${rolledBack.detail}; ${where}\n`);
+  return EXIT.rolledBack;
+}
+
 function report(outcome: MoveOutcome, json: boolean): number {
   switch (outcome.status) {
-    case "moved": {
-      const { plan, destination, parked } = outcome;
-      process.stdout.write(
-        json
-          ? `${JSON.stringify({ moved: { terminal: plan.terminal, machine: plan.machine, session: plan.session.id, destination, parked } })}\n`
-          : `moved ${plan.terminal} to ${destination} (session ${plan.session.id}); source terminal stopped\n`,
-      );
-      process.stderr.write(
-        parked.parked
-          ? `hc-teleport: source checkout parked under refs/hc-teleport/${plan.session.id}/\n`
-          : `hc-teleport: source checkout not parked: ${parked.reason}\n`,
-      );
-      return EXIT.ok;
-    }
+    case "moved":
+      return reportMoved(outcome, json);
     case "refused":
       return refuse(outcome.refusal, json);
-    case "rolled_back": {
-      const rolledBack = { reason: outcome.reason, detail: outcome.detail };
-      if (json) process.stdout.write(`${JSON.stringify({ rolledBack })}\n`);
-      process.stderr.write(`hc-teleport: rolled back (${rolledBack.reason}): ${rolledBack.detail}; the source was not touched\n`);
-      return EXIT.rolledBack;
-    }
+    case "rolled_back":
+      return reportRolledBack(outcome, json);
     case "rollback_failed":
       return fail(
-        { reason: "rollback_failed", detail: `${outcome.cause}; left on the destination: ${outcome.left.join("; ")}`, cause: outcome.cause, left: outcome.left },
+        { reason: "rollback_failed", detail: `${outcome.cause}; ${outcome.relocated ? "left" : "left on the destination"}: ${outcome.left.join("; ")}`, cause: outcome.cause, left: outcome.left },
+        json,
+        EXIT.failed,
+      );
+    case "source_not_stopped":
+      return fail(
+        { reason: "source_not_stopped", detail: `the source terminal could not be stopped and still runs; nothing was resumed elsewhere: ${outcome.detail}` },
         json,
         EXIT.failed,
       );
@@ -123,6 +136,21 @@ function report(outcome: MoveOutcome, json: boolean): number {
         EXIT.failed,
       );
   }
+}
+
+function reportRelocated(outcome: Extract<MoveOutcome, { relocated: true }>, json: boolean): number {
+  const { plan, destination, forget, forgetDetail } = outcome;
+  process.stdout.write(
+    json
+      ? `${JSON.stringify({ moved: { terminal: plan.terminal, machine: plan.machine, session: plan.session.id, destination, relocated: true, forget } })}\n`
+      : `moved ${plan.terminal} to ${destination} (session ${plan.session.id}); source terminal stopped\n`,
+  );
+  if (forget === "failed") {
+    process.stderr.write(
+      `hc-teleport: the herdr-wake record was not forgotten (${forgetDetail ?? "unknown"}): the session may be resumed twice after a reboot; run herdr-wake forget ${plan.terminal}\n`,
+    );
+  }
+  return EXIT.ok;
 }
 
 async function main(args: readonly string[]): Promise<number> {
