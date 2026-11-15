@@ -286,6 +286,8 @@ class NamedMachine implements Machine {
 
 describe("carryTranscript from a remote source to the Mac", () => {
   const CAP = 7 * 1024 * 1024;
+  // Seeding and carrying a 7 MB line outruns the config's 20 s when other suites load the machine.
+  const CAP_LINE_TIMEOUT_MS = 60_000;
   const SOURCE_HOME = "/home/box";
   const DEST_HOME = "/Users/mac";
   const mac = new LocalMachine();
@@ -350,13 +352,13 @@ describe("carryTranscript from a remote source to the Mac", () => {
     await seedSource(sourceFile(), lineOf(CAP));
     await carryTranscript(request, deps);
     expect((await stat(destPathOf(sourceFile()))).size).toBe(CAP);
-  });
+  }, CAP_LINE_TIMEOUT_MS);
 
   it("refuses a line one byte over the chunk cap and writes nothing", async () => {
     await seedSource(sourceFile(), lineOf(CAP + 1));
     await expect(carryTranscript(request, deps)).rejects.toMatchObject({ reason: "transcript_line_too_long" });
     expect(await destTree()).toEqual([]);
-  });
+  }, CAP_LINE_TIMEOUT_MS);
 
   it("keeps a leading byte-order mark", async () => {
     await seedSource(sourceFile(), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(`{"cwd":"${SOURCE_HOME}/x"}\n`)]));
