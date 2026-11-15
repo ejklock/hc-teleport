@@ -1,0 +1,10 @@
+{
+  "name": "hc-teleport",
+  "version": "0.2.0",
+  "description": "Move a Claude Code session to another machine: the /hc-teleport command and the hc-teleport skill. Other agents' sessions cannot move yet.",
+  "author": { "name": "Evaldo Klock" },
+  "license": "MIT",
+  "repository": "https://github.com/ejklock/hc-teleport",
+  "keywords": ["hc", "teleport", "session", "claude-code"],
+  "homepage": "https://github.com/ejklock/hc-teleport"
+}

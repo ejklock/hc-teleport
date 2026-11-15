@@ -1,0 +1,11 @@
+{
+  "name": "hc-teleport",
+  "plugins": [
+    {
+      "name": "hc-teleport",
+      "source": { "source": "local", "path": "./plugins/hc-teleport" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

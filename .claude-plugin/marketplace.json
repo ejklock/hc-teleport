@@ -1,0 +1,11 @@
+{
+  "name": "hc-teleport",
+  "description": "Move a Claude Code session to another machine: the /hc-teleport command and the hc-teleport skill. Other agents' sessions cannot move yet.",
+  "owner": { "name": "Evaldo Klock" },
+  "plugins": [
+    {
+      "name": "hc-teleport",
+      "source": "./plugins/hc-teleport"
+    }
+  ]
+}

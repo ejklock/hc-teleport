@@ -157,6 +157,16 @@ A rolled back move puts the destination back as it was before the move: it ends 
 | `unexpected_error` | Any other error after the first write, such as a file permission error while carrying the transcript; the detail is its message. |
 | `not_resumed` | The terminal is idle but the destination does not confirm the session; the detail is the check's reason: `terminal_not_running`, `not_claude`, `no_session`, `session_registry_unreadable`, `session_registry_stale` or `session_mismatch`. |
 
+## Plugins
+
+A `/hc-teleport <machine>` command and an `hc-teleport` skill tell the agent to run `hc-teleport <machine> --detach` once and end its turn, so the session moves once it is idle. They need the CLI installed. They run no MCP server. All four plugins ship now, but the CLI moves only Claude Code sessions today: for any other agent it refuses with `not_claude`, and the agent tells the person its sessions cannot move yet.
+
+- Claude Code: `/plugin marketplace add ejklock/hc-teleport`, then `/plugin install hc-teleport@hc-teleport`.
+- Codex: `codex plugin marketplace add ejklock/hc-teleport`, then `codex plugin add hc-teleport@hc-teleport`.
+- OpenCode and Pi: the npm package `hc-teleport-agent` (`packages/hc-teleport-agent`); its README has the setup for each.
+
+Each plugin and the package carry this CLI's version.
+
 ## Development
 
 ```
