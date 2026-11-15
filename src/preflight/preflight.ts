@@ -3,8 +3,6 @@ import { ProcessError, type Runner } from "../platform/process.ts";
 import type { AgentAdapter, DestinationRefusalReason, RemoteRun } from "../session/agent-adapter.ts";
 import type { SessionPlan } from "../session/index.ts";
 
-const SPAWN_FAILED = '"kind":"spawn_failed"';
-
 type Refusal = { reason: DestinationRefusalReason | "dest_repo_missing"; detail: string };
 
 export type PreflightResult =
@@ -70,7 +68,7 @@ export async function preflight(
       return await deps.hc.exec(argv, place);
     } catch (error) {
       // hc reports a program that cannot start as its own failure, not as an exit code.
-      if (error instanceof HcError && error.message.includes(SPAWN_FAILED)) {
+      if (error instanceof HcError && error.kind === "spawn_failed") {
         return { code: 127, stdout: "", stderr: error.message };
       }
       throw error;

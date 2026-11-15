@@ -475,3 +475,35 @@ describe("the way back, to the Mac", () => {
     await expect(check(hc)).rejects.toBeInstanceOf(HcError);
   });
 });
+
+describe("a destination program that hc cannot start", () => {
+  const spawnFailed = (program: string) => `{"error":{"kind":"spawn_failed","message":"cannot start ${program}: No such file or directory"}}`;
+  const check = (message: string) =>
+    preflight(
+      { plan: planWith(), machine: MACHINE },
+      {
+        hc: {
+          exec: async (argv: readonly string[]): Promise<HcExecResult> => {
+            throw new HcError(`hc exec ${argv.join(" ")}: ${message}`);
+          },
+        },
+        run: sourceRunner(box()).run,
+        adapter: new ClaudeAdapter(new LocalMachine()),
+      },
+    );
+
+  it("reads as exit 127 with hc's message when hc reports spawn_failed", async () => {
+    const result = await check(spawnFailed("git"));
+
+    expect(result).toMatchObject({
+      ok: false,
+      refusal: { reason: "dest_repo_missing", detail: expect.stringContaining("cannot start git") },
+    });
+  });
+
+  it("is rethrown when the text spawn_failed only appears before hc's trailing error of another kind", async () => {
+    const message = `could not run ${spawnFailed("git")} then {"error":{"kind":"unreachable","message":"machine unreachable"}}`;
+
+    await expect(check(message)).rejects.toBeInstanceOf(HcError);
+  });
+});
