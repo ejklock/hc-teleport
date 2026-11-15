@@ -135,12 +135,36 @@ async function cli(args: string[], setup: Setup = {}): Promise<{ run: Run; seen:
   return { run: { stdout, stderr, exit: typeof process.exitCode === "number" ? process.exitCode : undefined }, seen };
 }
 
+/** The `--started-at` value of the one runner a start launched. */
+function startedAtOf(seen: Seen): number {
+  const argv = seen.run.flat();
+  return Number(argv[argv.indexOf("--started-at") + 1]);
+}
+
+describe("runner options", () => {
+  const OPTIONS = [["--session", SESSION], ["--source", "t2s"], ["--to", "base-digital"], ["--started-at", "1"]];
+  const COMMANDS = [["status"], ["t1", "base-digital"], ["t1", "base-digital", "--dry-run"], ["base-digital", "--detach"]];
+
+  it.each(OPTIONS.flatMap((option) => COMMANDS.map((command) => ({ name: option[0], title: command.join(" "), option, command }))))(
+    "refuses $name given to `$title` as a usage error, writing and starting nothing",
+    async ({ name, option, command }) => {
+      const { run, seen } = await cli([...command, ...option], { env: { HC_TERMINAL_ID: "t2s" } });
+
+      expect(run.exit).toBe(2);
+      expect(run.stderr).toContain(name);
+      expect(run.stdout).toBe("");
+      expect(seen.run).toEqual([]);
+      await expect(readdir(stateFolder())).rejects.toThrow();
+    },
+  );
+});
+
 describe("starts a detached move", () => {
   it("from a terminal on an hc machine: plans for machine/terminal, drops HC_SESSION from every hc call and prints the runner", async () => {
     const { run, seen } = await cli(["base-digital", "--detach"], { env: { HC_TERMINAL_ID: "t7", HC_SESSION: "base-digital" }, machines: ["base-digital"] });
 
     expect(run.exit).toBe(0);
-    expect(run.stdout).toBe("detached: t99 will move base-digital/t7 to base-digital once it is idle; see hc-teleport status\n");
+    expect(run.stdout).toMatch(/^detached: t99 will move base-digital\/t7 to base-digital once it is idle \(started \S+\); see hc-teleport status\n$/);
     expect(seen.planned).toEqual([{ terminal: "base-digital/t7", machine: "base-digital", requireIdle: false }]);
     expect(seen.hcSessionAtCall.length).toBeGreaterThan(0);
     expect(seen.hcSessionAtCall.every((value) => value === undefined)).toBe(true);
@@ -154,9 +178,12 @@ describe("starts a detached move", () => {
     const [node, entry, flag, state, ...rest] = seen.run[0] ?? [];
     expect(node).toBe(process.execPath);
     expect(entry).toMatch(/src[\\/]app[\\/]cli\.(ts|js)$/);
-    expect([flag, state, rest]).toEqual(["--run-detached", file, []]);
+    expect([flag, state]).toEqual(["--run-detached", file]);
+    expect(rest.slice(0, 10)).toEqual(["--session", SESSION, "--source", "t2s", "--to", "base-digital", "--wait", "300", "--timeout", "120"]);
+    expect(rest[10]).toBe("--started-at");
+    expect(rest).toHaveLength(12);
     expect(seen.names).toEqual(["hct-09e11b42f5c14c3899f1dd1d8b00"]);
-    expect(await readdir(stateFolder())).toEqual([`${SESSION}.json`]);
+    await expect(readdir(stateFolder())).rejects.toThrow();
   });
 
   it("refuses hc_failed with exit 1 for any other hc run failure, leaving no state file", async () => {
@@ -164,7 +191,7 @@ describe("starts a detached move", () => {
 
     expect(run.exit).toBe(1);
     expect(run.stderr).toContain("hc_failed");
-    expect(await readdir(stateFolder())).toEqual([]);
+    await expect(readdir(stateFolder())).rejects.toThrow();
   });
 
   it.each([["--wait", "30"], ["--timeout", "30"], ["--dry-run"]])("refuses status with %s as a usage error, exit 2", async (...flags) => {
@@ -175,12 +202,24 @@ describe("starts a detached move", () => {
   });
 
   it("prints the runner as json with --json", async () => {
-    const { run } = await cli(["base-digital", "--detach", "--json", "--wait", "30"], { env: { HC_TERMINAL_ID: "t2s" } });
+    const { run, seen } = await cli(["base-digital", "--detach", "--json", "--wait", "30"], { env: { HC_TERMINAL_ID: "t2s" } });
 
     expect(JSON.parse(run.stdout)).toEqual({
-      detached: { runner: "t99", source: "t2s", machine: "base-digital", state: join(stateFolder(), `${SESSION}.json`) },
+      detached: { runner: "t99", source: "t2s", machine: "base-digital", state: join(stateFolder(), `${SESSION}.json`), startedAt: startedAtOf(seen) },
     });
     expect(run.exit).toBe(0);
+  });
+
+  it("prints the start time the runner receives, in the line and in json", async () => {
+    const text = await cli(["base-digital", "--detach"], { env: { HC_TERMINAL_ID: "t2s" } });
+    const given = startedAtOf(text.seen);
+    expect(given).toBeGreaterThan(0);
+    expect(text.run.stdout).toContain(`started ${new Date(given).toISOString()}`);
+
+    liveNames.clear();
+    const json = await cli(["base-digital", "--detach", "--json"], { env: { HC_TERMINAL_ID: "t2s" } });
+    const jsonGiven = startedAtOf(json.seen);
+    expect(JSON.parse(json.run.stdout)).toMatchObject({ detached: { startedAt: jsonGiven } });
   });
 
   it("refuses not_in_a_terminal with exit 2 when HC_TERMINAL_ID is empty, starting nothing", async () => {
@@ -226,7 +265,7 @@ describe("starts a detached move", () => {
     expect(run.stderr).toContain("move_in_progress");
     expect(run.stderr).toContain("hct-09e11b42f5c14c3899f1dd1d8b00");
     expect(seen.run).toHaveLength(1);
-    expect(await readdir(stateFolder())).toEqual([`${SESSION}.json`]);
+    await expect(readdir(stateFolder())).rejects.toThrow();
   });
 
   it.each([["--wait", "0"], ["--wait", "abc"], ["--timeout", "0"]])("rejects %s %s as a usage error", async (flag, value) => {
@@ -272,11 +311,19 @@ describe("status of detached moves", () => {
 
     expect(JSON.parse(run.stdout)).toEqual({
       moves: [
-        { file: join(stateFolder(), "a.json"), session: SESSION, source: "t2s", machine: "base-digital", phase: "refused", runner: "t9", reason: "dest_dirty", detail: "dirty" },
-        { file: join(stateFolder(), "b.json"), session: "other", source: "t2s", machine: "base-digital", phase: "waiting", runner: "t5" },
+        { file: join(stateFolder(), "a.json"), session: SESSION, source: "t2s", machine: "base-digital", phase: "refused", runner: "t9", startedAt: 0, reason: "dest_dirty", detail: "dirty" },
+        { file: join(stateFolder(), "b.json"), session: "other", source: "t2s", machine: "base-digital", phase: "waiting", runner: "t5", startedAt: 0 },
       ],
     });
     expect(run.exit).toBe(0);
+  });
+
+  it("shows each move's start time in its line", async () => {
+    await put(join(stateFolder(), "a.json"), { ...base, startedAt: 1_700_000_000_000 });
+
+    const { run } = await cli(["status"], { liveTerminals: ["t9"] });
+
+    expect(run.stdout).toContain(`started ${new Date(1_700_000_000_000).toISOString()}`);
   });
 
   it("shows runner_lost for a running move whose runner terminal no longer lives, and for one that never recorded a runner", async () => {
@@ -305,12 +352,13 @@ describe("status of detached moves", () => {
 });
 
 describe("runs a detached move", () => {
-  const unrecorded = { v: 1, session: SESSION, source: "t2s", machine: "base-digital", phase: "waiting", waitSeconds: 300, timeoutSeconds: 120, startedAt: 0 };
   const file = (): string => join(stateFolder(), `${SESSION}.json`);
+  const arguments_ = (): string[] => [
+    "--run-detached", file(), "--session", SESSION, "--source", "t2s", "--to", "base-digital", "--wait", "300", "--timeout", "120", "--started-at", "0",
+  ];
 
   async function ended(env: Record<string, string>): Promise<unknown> {
-    await put(file(), unrecorded);
-    const { run } = await cli(["--run-detached", file()], { env });
+    const { run } = await cli(arguments_(), { env });
     expect(run.exit).toBe(1);
     const state: unknown = JSON.parse(await readFile(file(), "utf8"));
     return state;
@@ -322,5 +370,18 @@ describe("runs a detached move", () => {
 
   it("records the machine HC_SESSION names in front of the terminal, as the source is addressed", async () => {
     expect(await ended({ HC_TERMINAL_ID: "t5", HC_SESSION: "base-digital" })).toMatchObject({ phase: "timeout", runner: "base-digital/t5" });
+  });
+
+  it.each([
+    ["no start parameters", ["--run-detached", "/unused"]],
+    ["a wait that is not a number", ["--session", SESSION, "--source", "t2s", "--to", "m", "--wait", "soon", "--timeout", "120", "--started-at", "0"]],
+    ["a missing source", ["--session", SESSION, "--to", "m", "--wait", "300", "--timeout", "120", "--started-at", "0"]],
+  ])("fails and writes no state file given %s", async (_title, args) => {
+    const argv = args[0] === "--run-detached" ? args : ["--run-detached", file(), ...args];
+    const { run } = await cli(argv, { env: { HC_TERMINAL_ID: "t5" } });
+
+    expect(run.exit).toBe(1);
+    expect(run.stderr).toContain("hc_failed");
+    await expect(readdir(stateFolder())).rejects.toThrow();
   });
 });

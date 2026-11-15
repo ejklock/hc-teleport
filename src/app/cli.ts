@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { configPath, loadConfig, nodeConfigFs, type Config } from "../config/config.ts";
 import { InputEnded, LOCAL, renderDoctor, runDoctor, runInit } from "./init.ts";
-import { detachedMoves, runDetached, sourceAddress, startDetached, type MoveRow } from "../detach/detach.ts";
+import { detachedMoves, runDetached, sourceAddress, startDetached, type MoveRow, type RunStart } from "../detach/detach.ts";
 import { stateDir, statePath } from "../detach/state.ts";
 import { Hc, HcError } from "../platform/hc.ts";
 import { moveSession, type MoveOutcome } from "../move/index.ts";
@@ -181,6 +181,10 @@ async function main(args: readonly string[]): Promise<number> {
         detach: { type: "boolean" },
         wait: { type: "string" },
         "run-detached": { type: "string" },
+        session: { type: "string" },
+        source: { type: "string" },
+        to: { type: "string" },
+        "started-at": { type: "string" },
       },
       allowPositionals: true,
       strict: true,
@@ -197,22 +201,45 @@ async function main(args: readonly string[]): Promise<number> {
       detach: parsed.values.detach === true,
       wait: parsed.values.wait,
       runDetached: parsed.values["run-detached"],
+      runArgs: { session: parsed.values.session, source: parsed.values.source, to: parsed.values.to, startedAt: parsed.values["started-at"] },
     });
   } catch (error) {
     return failure(error, json);
   }
 }
 
-type Flags = { dryRun: boolean; timeout: string | undefined; json: boolean; detach: boolean; wait: string | undefined; runDetached: string | undefined };
+type RunArgs = { session: string | undefined; source: string | undefined; to: string | undefined; startedAt: string | undefined };
+type Flags = {
+  dryRun: boolean;
+  timeout: string | undefined;
+  json: boolean;
+  detach: boolean;
+  wait: string | undefined;
+  runDetached: string | undefined;
+  runArgs: RunArgs;
+};
 
 /** The commands of the detached mode (the runner, `status`, `--detach`); nothing when the arguments are for another command. */
 function dispatchDetached(positionals: readonly string[], flags: Flags): Promise<number> | undefined {
+  if (flags.runDetached === undefined) {
+    const stray = strayRunnerOption(flags.runArgs);
+    if (stray !== undefined) return Promise.resolve(usageError(`${stray} only goes with --run-detached`));
+  }
   if (flags.runDetached !== undefined) {
-    return positionals.length === 0 ? runner(flags.runDetached) : Promise.resolve(usageError("--run-detached takes no terminal or machine"));
+    return positionals.length === 0 ? runner(flags.runDetached, flags) : Promise.resolve(usageError("--run-detached takes no terminal or machine"));
   }
   if (flags.detach) return detachFrom(positionals, flags);
   if (positionals.length === 1 && positionals[0] === "status") return statusCommand(flags);
   return flags.wait === undefined ? undefined : Promise.resolve(usageError("--wait only goes with --detach"));
+}
+
+/** The first runner-only option given, which no other command takes. */
+function strayRunnerOption(args: RunArgs): string | undefined {
+  if (args.session !== undefined) return "--session";
+  if (args.source !== undefined) return "--source";
+  if (args.to !== undefined) return "--to";
+  if (args.startedAt !== undefined) return "--started-at";
+  return undefined;
 }
 
 function statusCommand(flags: Flags): Promise<number> {
@@ -295,22 +322,37 @@ async function teleportDetached({ machine, timeoutSeconds, waitSeconds, json }: 
     },
   );
   if (started.status === "refused") return refuse(started.refusal, json);
-  const { runner, state } = started;
+  const { runner, state, startedAt } = started;
   process.stdout.write(
     json
-      ? `${JSON.stringify({ detached: { runner, source: started.source, machine: started.machine, state } })}\n`
-      : `detached: ${runner} will move ${started.source} to ${started.machine} once it is idle; see hc-teleport status\n`,
+      ? `${JSON.stringify({ detached: { runner, source: started.source, machine: started.machine, state, startedAt } })}\n`
+      : `detached: ${runner} will move ${started.source} to ${started.machine} once it is idle (started ${new Date(startedAt).toISOString()}); see hc-teleport status\n`,
   );
   return EXIT.ok;
 }
 
+/** The move a runner was started for, from its arguments; nothing when one is missing or malformed. */
+function runStart(flags: Flags): RunStart | undefined {
+  const { session, source, to, startedAt } = flags.runArgs;
+  const waitSeconds = flags.wait === undefined ? undefined : parseWait(flags.wait);
+  const timeoutSeconds = flags.timeout === undefined ? undefined : parseTimeout(flags.timeout);
+  if (!session || !source || !to || startedAt === undefined || !/^\d+$/.test(startedAt)) return undefined;
+  if (waitSeconds === undefined || timeoutSeconds === undefined) return undefined;
+  return { session, source, machine: to, waitSeconds, timeoutSeconds, startedAt: Number(startedAt) };
+}
+
 /** The terminal `--detach` started: waits, moves and records, exiting 0 only for a session that moved. */
-async function runner(stateFile: string): Promise<number> {
+async function runner(stateFile: string, flags: Flags): Promise<number> {
+  const start = runStart(flags);
+  if (start === undefined) {
+    return fail({ reason: "hc_failed", detail: "the runner was not given the move it is to run: --session, --source, --to, --wait, --timeout and --started-at" }, flags.json, EXIT.failed);
+  }
   const own = sourceAddress(process.env);
   reachCore();
   const hc = new Hc();
   const run = processRunner();
   const final = await runDetached(stateFile, {
+    start,
     hc,
     ...(own.ok ? { runner: own.source } : {}),
     move: (request) => moveSession(request, { hc, run, home: homedir() }),
@@ -323,10 +365,11 @@ async function runner(stateFile: string): Promise<number> {
 
 function renderRow(row: MoveRow): string {
   const what = row.session === undefined ? row.file : `${row.session}  ${row.source ?? "?"} -> ${row.machine ?? "?"}`;
+  const startedNote = row.startedAt === undefined ? "" : `  started ${new Date(row.startedAt).toISOString()}`;
   const runnerNote = row.runner === undefined ? "" : `  runner ${row.runner}`;
   const lost = row.runner_lost === true ? "  runner_lost" : "";
   const why = row.reason === undefined ? (row.detail === undefined ? "" : `: ${row.detail}`) : `  ${row.reason}: ${row.detail ?? ""}`;
-  return `${what}  ${row.phase}${lost}${runnerNote}${why}`;
+  return `${what}${startedNote}  ${row.phase}${lost}${runnerNote}${why}`;
 }
 
 async function status(json: boolean): Promise<number> {

@@ -2,7 +2,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { detachedMoves, runDetached, sourceAddress, type MoveRow, startDetached, type RunnerHc, type StarterHc, type StartDeps } from "../../src/detach/detach.ts";
+import { detachedMoves, runDetached, sourceAddress, type MoveRow, startDetached, type RunDeps, type RunnerHc, type StarterHc, type StartDeps } from "../../src/detach/detach.ts";
 import { readState, writeState, type DetachedState, type Phase } from "../../src/detach/state.ts";
 import { HcError, type HcMachine, type HcTerminal, type HcWaitOutcome } from "../../src/platform/hc.ts";
 import type { MoveOutcome } from "../../src/move/index.ts";
@@ -18,6 +18,7 @@ let path: string;
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "hct-detach-"));
   path = join(dir, `${SESSION}.json`);
+  started = startOf(initial);
 });
 
 afterEach(async () => {
@@ -130,7 +131,20 @@ const plan: SessionPlan = {
 };
 const moved: MoveOutcome = { status: MOVED, plan, destination: "base-digital/t3", relocated: true, forget: "done" };
 
+const startOf = ({ session, source, machine, waitSeconds, timeoutSeconds, startedAt }: DetachedState): RunDeps["start"] => ({
+  session,
+  source,
+  machine,
+  waitSeconds,
+  timeoutSeconds,
+  startedAt,
+});
+
+/** What the runner is started with; a seed that sets the wait changes it too. */
+let started = startOf(initial);
+
 async function seed(over: Partial<DetachedState> = {}): Promise<void> {
+  started = startOf({ ...initial, ...over });
   await writeState(path, { ...initial, ...over });
 }
 
@@ -153,20 +167,36 @@ describe("runs a detached move", () => {
       return moved;
     };
 
-    await runDetached(path, { hc, move, now: clock.read, runner: "t9" });
+    await runDetached(path, { start: started, hc, move, now: clock.read, runner: "t9" });
 
     expect(during).toHaveLength(1);
     expect(during[0]).toMatchObject({ phase: "moving", runner: "t9" });
     expect(during[0]).not.toHaveProperty("runner_lost");
     expect(await finalState()).toMatchObject({ phase: "moved", runner: "t9" });
   });
+  it("writes its first state itself from its start, waiting and with its own address, over a file that holds an earlier move", async () => {
+    await seed({ phase: "moved", runner: "t8", outcome: { destination: "old/t1" }, startedAt: 1 });
+    const clock = new Clock();
+    const hc = new FakeRunnerHc(clock, [IDLE]);
+    const first: DetachedState[] = [];
+    const move = async (): Promise<MoveOutcome> => {
+      first.push(await finalState());
+      return moved;
+    };
+    const start = { session: SESSION, source: "t2s", machine: "other-machine", waitSeconds: 300, timeoutSeconds: 120, startedAt: 7 };
+
+    await runDetached(path, { start, hc, move, now: clock.read, runner: "t9" });
+
+    expect(first[0]).toEqual({ v: 1, ...start, phase: "moving", runner: "t9" });
+  });
+
   it("moves at once when the source is idle, holding phase moving during the move and moved after", async () => {
     await seed();
     const clock = new Clock();
     const hc = new FakeRunnerHc(clock, [IDLE]);
     const { move, requests, phases } = fakeMove([moved]);
 
-    await runDetached(path, { hc, move, now: clock.read });
+    await runDetached(path, { start: started, hc, move, now: clock.read });
 
     expect(requests).toEqual([{ terminal: "t2s", machine: "base-digital", timeoutSeconds: 120 }]);
     expect(phases).toEqual(["moving"]);
@@ -180,7 +210,7 @@ describe("runs a detached move", () => {
     const hc = new FakeRunnerHc(clock, [{ kind: "timeout" }, { kind: "interrupted", reason: "message" }, { kind: "timeout" }, IDLE]);
     const { move, requests } = fakeMove([moved]);
 
-    await runDetached(path, { hc, move, now: clock.read });
+    await runDetached(path, { start: started, hc, move, now: clock.read });
 
     expect(hc.waits).toHaveLength(4);
     expect(requests).toHaveLength(1);
@@ -193,7 +223,7 @@ describe("runs a detached move", () => {
     const hc = new FakeRunnerHc(clock, []);
     const { move, requests } = fakeMove([]);
 
-    await runDetached(path, { hc, move, now: clock.read });
+    await runDetached(path, { start: started, hc, move, now: clock.read });
 
     expect(hc.waits).toEqual([600, 100]);
     expect(requests).toEqual([]);
@@ -209,7 +239,7 @@ describe("runs a detached move", () => {
     hc.live = false;
     const { move, requests } = fakeMove([]);
 
-    await runDetached(path, { hc, move, now: clock.read });
+    await runDetached(path, { start: started, hc, move, now: clock.read });
 
     expect(requests).toEqual([]);
     expect(await finalState()).toMatchObject({ phase: "refused", outcome: { reason: "source_gone" } });
@@ -222,7 +252,7 @@ describe("runs a detached move", () => {
     const hc = new FakeRunnerHc(clock, [{ kind: "blocked" }]);
     const { move, requests } = fakeMove([]);
 
-    await runDetached(path, { hc, move, now: clock.read });
+    await runDetached(path, { start: started, hc, move, now: clock.read });
 
     expect(requests).toEqual([]);
     expect(await finalState()).toMatchObject({ phase: "refused", outcome: { reason: "source_not_idle" } });
@@ -235,7 +265,7 @@ describe("runs a detached move", () => {
     const worked = { status: "refused", refusal: { reason: "not_idle", detail: "t2s reports status working" } } as const;
     const { move, requests, phases } = fakeMove([worked, moved]);
 
-    await runDetached(path, { hc, move, now: clock.read });
+    await runDetached(path, { start: started, hc, move, now: clock.read });
 
     expect(requests).toHaveLength(2);
     expect(phases).toEqual(["moving", "moving"]);
@@ -249,7 +279,7 @@ describe("runs a detached move", () => {
     const worked = { status: "rolled_back", reason: "source_not_idle", detail: "t2s reports status working" } as const;
     const { move } = fakeMove([worked]);
 
-    await runDetached(path, { hc, move, now: clock.read });
+    await runDetached(path, { start: started, hc, move, now: clock.read });
 
     expect((await finalState()).phase).toBe("timeout");
   });
@@ -261,7 +291,7 @@ describe("runs a detached move", () => {
     hc.wait = () => Promise.reject(new HcError("hc wait t2s: not found"));
     const { move } = fakeMove([]);
 
-    await runDetached(path, { hc, move, now: clock.read });
+    await runDetached(path, { start: started, hc, move, now: clock.read });
 
     expect(await finalState()).toMatchObject({ phase: "refused", outcome: { reason: "runner_failed", detail: "hc wait t2s: not found" } });
   });
@@ -291,7 +321,7 @@ describe("runs a detached move", () => {
     const clock = new Clock();
     const hc = new FakeRunnerHc(clock, [IDLE]);
 
-    await runDetached(path, { hc, move: fakeMove([outcome]).move, now: clock.read });
+    await runDetached(path, { start: started, hc, move: fakeMove([outcome]).move, now: clock.read });
 
     expect(await finalState()).toMatchObject({ phase, outcome: stored });
   });
@@ -304,7 +334,7 @@ describe("reports a failed detached move", () => {
     const hc = new FakeRunnerHc(clock, [IDLE]);
     const refused = { status: "refused", refusal: { reason: "dest_dirty", detail: "the destination is dirty" } } as const;
 
-    await runDetached(path, { hc, move: fakeMove([refused]).move, now: clock.read });
+    await runDetached(path, { start: started, hc, move: fakeMove([refused]).move, now: clock.read });
 
     expect(hc.sent).toEqual([{ address: "t2s", text: "hc-teleport: refused (dest_dirty); see hc-teleport status" }]);
   });
@@ -316,7 +346,7 @@ describe("reports a failed detached move", () => {
     const detail = "line one\nrm -rf ~\u001b[31m /home/box/.claude/projects/p/s.jsonl";
     const refused = { status: "refused", refusal: { reason: "dest_dirty", detail } } as const;
 
-    await runDetached(path, { hc, move: fakeMove([refused]).move, now: clock.read });
+    await runDetached(path, { start: started, hc, move: fakeMove([refused]).move, now: clock.read });
 
     expect(hc.sent).toEqual([{ address: "t2s", text: "hc-teleport: refused (dest_dirty); see hc-teleport status" }]);
     expect(await finalState()).toMatchObject({ outcome: { reason: "dest_dirty", detail } });
@@ -326,12 +356,12 @@ describe("reports a failed detached move", () => {
     await seed();
     const clock = new Clock();
     const hc = new FakeRunnerHc(clock, [IDLE]);
-    await runDetached(path, { hc, move: fakeMove([{ status: "rolled_back", reason: "did_not_start", detail: "no" }]).move, now: clock.read });
+    await runDetached(path, { start: started, hc, move: fakeMove([{ status: "rolled_back", reason: "did_not_start", detail: "no" }]).move, now: clock.read });
     expect(hc.sent.map(({ text }) => text)).toEqual(["hc-teleport: rolled_back (did_not_start); see hc-teleport status"]);
 
     await seed({ waitSeconds: 5 });
     const second = new FakeRunnerHc(clock, []);
-    await runDetached(path, { hc: second, move: fakeMove([]).move, now: clock.read });
+    await runDetached(path, { start: started, hc: second, move: fakeMove([]).move, now: clock.read });
     expect(second.sent).toHaveLength(1);
     expect(second.sent[0]?.text).toMatch(/^hc-teleport: timeout \(wait_timeout\); see hc-teleport status$/);
   });
@@ -342,7 +372,7 @@ describe("reports a failed detached move", () => {
     const hc = new FakeRunnerHc(clock, [IDLE]);
     const back = { status: "rolled_back", reason: "did_not_start", detail: "no", resumedAt: "t12" } as const;
 
-    await runDetached(path, { hc, move: fakeMove([back]).move, now: clock.read });
+    await runDetached(path, { start: started, hc, move: fakeMove([back]).move, now: clock.read });
 
     expect(hc.sent.map(({ address }) => address)).toEqual(["t12"]);
     expect(await finalState()).toMatchObject({ phase: "rolled_back", outcome: { resumedAt: "t12" } });
@@ -352,13 +382,13 @@ describe("reports a failed detached move", () => {
     await seed();
     const clock = new Clock();
     const worked = new FakeRunnerHc(clock, [IDLE]);
-    await runDetached(path, { hc: worked, move: fakeMove([moved]).move, now: clock.read });
+    await runDetached(path, { start: started, hc: worked, move: fakeMove([moved]).move, now: clock.read });
     expect(worked.sent).toEqual([]);
 
     await seed();
     const gone = new FakeRunnerHc(clock, [IDLE]);
     gone.live = false;
-    await runDetached(path, { hc: gone, move: fakeMove([{ status: "refused", refusal: { reason: "x", detail: "y" } }]).move, now: clock.read });
+    await runDetached(path, { start: started, hc: gone, move: fakeMove([{ status: "refused", refusal: { reason: "x", detail: "y" } }]).move, now: clock.read });
     expect(gone.sent).toEqual([]);
   });
 
@@ -368,7 +398,7 @@ describe("reports a failed detached move", () => {
     const hc = new FakeRunnerHc(clock, [IDLE]);
     hc.sendFails = true;
 
-    await runDetached(path, { hc, move: fakeMove([{ status: "refused", refusal: { reason: "dest_dirty", detail: "d" } }]).move, now: clock.read });
+    await runDetached(path, { start: started, hc, move: fakeMove([{ status: "refused", refusal: { reason: "dest_dirty", detail: "d" } }]).move, now: clock.read });
 
     expect(await finalState()).toMatchObject({ phase: "refused", sendError: "hc send: gone" });
   });
@@ -383,7 +413,7 @@ describe("reports a failed detached move", () => {
       throw new HcError("hc send: gone");
     };
 
-    const returned = await runDetached(path, { hc, move: fakeMove([{ status: "refused", refusal: { reason: "dest_dirty", detail: "d" } }]).move, now: clock.read });
+    const returned = await runDetached(path, { start: started, hc, move: fakeMove([{ status: "refused", refusal: { reason: "dest_dirty", detail: "d" } }]).move, now: clock.read });
 
     expect(phasesWhenTyped).toEqual(["moving"]);
     expect(await finalState()).toMatchObject({ phase: "refused", outcome: { reason: "dest_dirty", detail: "d" }, sendError: "hc send: gone" });
@@ -395,7 +425,7 @@ describe("reports a failed detached move", () => {
     const clock = new Clock();
     const hc = new FakeRunnerHc(clock, [IDLE]);
 
-    const returned = await runDetached(path, { hc, move: fakeMove([{ status: "refused", refusal: { reason: "dest_dirty", detail: "d" } }]).move, now: clock.read });
+    const returned = await runDetached(path, { start: started, hc, move: fakeMove([{ status: "refused", refusal: { reason: "dest_dirty", detail: "d" } }]).move, now: clock.read });
 
     expect(await finalState()).toEqual(returned);
     expect(returned).not.toHaveProperty("sendError");
@@ -418,6 +448,10 @@ describe("starts a detached move", () => {
   type Call = { argv: readonly string[]; options: object | undefined };
   /** The name hc gives the runner: `hct-` and the first 28 hex digits of the session id. */
   const RUNNER_NAME = "hct-09e11b42f5c14c3899f1dd1d8b00";
+  /** The runner's argv for the default request: the state file and the move's parameters, as the runner writes its first state from them. */
+  const runnerArgv = (): string[] => [
+    "/usr/bin/node", "/opt/cli.js", "--run-detached", path, "--session", SESSION, "--source", "t2s", "--to", "base-digital", "--wait", "300", "--timeout", "120", "--started-at", "4000",
+  ];
 
   /** An hc that, like the real one, refuses a name a live terminal holds and frees it when that terminal ends. */
   function starter(machines: readonly string[], failure?: { kind: string }): { hc: StarterHc; calls: Call[]; live: Set<string>; end: () => void } {
@@ -450,10 +484,22 @@ describe("starts a detached move", () => {
 
     const result = await startDetached(request, deps(hc));
 
-    expect(result).toEqual({ status: "started", runner: "t9", source: "t2s", machine: "base-digital", state: path });
-    expect(calls).toEqual([{ argv: ["/usr/bin/node", "/opt/cli.js", "--run-detached", path], options: { name: RUNNER_NAME } }]);
-    expect(await finalState()).toEqual({ v: 1, session: SESSION, source: "t2s", machine: "base-digital", phase: "waiting", waitSeconds: 300, timeoutSeconds: 120, startedAt: 4_000 });
-    expect(await readdir(dir)).toEqual([`${SESSION}.json`]);
+    expect(result).toEqual({ status: "started", runner: "t9", source: "t2s", machine: "base-digital", state: path, startedAt: 4000 });
+    expect(calls).toEqual([{ argv: runnerArgv(), options: { name: RUNNER_NAME } }]);
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  it("reports the start time the runner receives, even when the clock advances on every read", async () => {
+    const { hc, calls } = starter([]);
+    let reads = 0;
+    const advancing = (): number => 5_000 + 1_000 * reads++;
+
+    const result = await startDetached(request, { ...deps(hc), now: advancing });
+
+    const argv = calls[0]?.argv ?? [];
+    const passed = argv[argv.indexOf("--started-at") + 1];
+    expect(passed).toBeDefined();
+    expect(result).toMatchObject({ status: "started", startedAt: Number(passed) });
   });
 
   it("refuses move_in_progress naming the runner's name while that runner lives, starting nothing and leaving the running move's file, then starts once it ended", async () => {
@@ -467,16 +513,16 @@ describe("starts a detached move", () => {
       refusal: { reason: "move_in_progress", detail: `a detached move of session ${SESSION} is already running as ${RUNNER_NAME}; see hc-teleport status` },
     });
     expect(calls).toHaveLength(2);
-    expect(await finalState()).toMatchObject({ phase: "waiting", startedAt: 4_000 });
-    expect(await readdir(dir)).toEqual([`${SESSION}.json`]);
+    expect(await readdir(dir)).toEqual([]);
 
     end();
     expect(await startDetached(request, { ...deps(hc), now: () => 12_000 })).toMatchObject({ status: "started" });
-    expect(await finalState()).toMatchObject({ startedAt: 12_000 });
-    expect(await readdir(dir)).toEqual([`${SESSION}.json`]);
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.argv.slice(-2)).toEqual(["--started-at", "12000"]);
+    expect(await readdir(dir)).toEqual([]);
   });
 
-  it("removes the state file of a move that was refused its name when none existed before", async () => {
+  it("writes no state file for a move that was refused its name", async () => {
     const { hc, live } = starter([]);
     live.add(RUNNER_NAME);
 
@@ -485,7 +531,7 @@ describe("starts a detached move", () => {
     expect(await readdir(dir)).toEqual([]);
   });
 
-  it("passes any other hc failure on and leaves no state file", async () => {
+  it("passes any other hc failure on and writes no state file", async () => {
     const { hc } = starter([], { kind: "spawn_failed" });
 
     await expect(startDetached(request, deps(hc))).rejects.toMatchObject({ kind: "spawn_failed" });
@@ -497,7 +543,7 @@ describe("starts a detached move", () => {
     const { hc } = starter([]);
     const clock = new Clock();
     hc.run = async () => {
-      await runDetached(path, { hc: new FakeRunnerHc(clock, [IDLE]), move: fakeMove([moved]).move, now: clock.read, runner: "t9" });
+      await runDetached(path, { start: started, hc: new FakeRunnerHc(clock, [IDLE]), move: fakeMove([moved]).move, now: clock.read, runner: "t9" });
       return "t9";
     };
 
@@ -506,21 +552,59 @@ describe("starts a detached move", () => {
     expect(await finalState()).toMatchObject({ phase: "moved", runner: "t9" });
   });
 
-  it("replaces the file of a running move whose runner is gone, as hc has freed its name", async () => {
+  it("leaves the file of a running move whose runner is gone to the runner it starts", async () => {
     await seed({ phase: "moving", runner: "t8" });
     const { hc } = starter([]);
 
     expect(await startDetached(request, deps(hc))).toMatchObject({ status: "started" });
-    expect(await finalState()).toEqual({ v: 1, session: SESSION, source: "t2s", machine: "base-digital", phase: "waiting", waitSeconds: 300, timeoutSeconds: 120, startedAt: 4_000 });
+    expect(await finalState()).toEqual({ ...initial, phase: "moving", runner: "t8" });
   });
 
-  it("puts a running move's file back when its runner still holds the name", async () => {
+  it("leaves a running move's file as it was when its runner still holds the name", async () => {
     await seed({ phase: "moving", runner: "t8" });
     const { hc, live } = starter([]);
     live.add(RUNNER_NAME);
 
     expect(await startDetached(request, deps(hc))).toMatchObject({ status: "refused", refusal: { reason: "move_in_progress" } });
     expect(await finalState()).toEqual({ ...initial, phase: "moving", runner: "t8" });
+  });
+
+  it("leaves a moved report as it was when a start follows before its runner exits", async () => {
+    const report: Partial<DetachedState> = { phase: "moved", runner: "t8", outcome: { destination: "base-digital/t3" } };
+    await seed(report);
+    const { hc, live } = starter([]);
+    live.add(RUNNER_NAME);
+
+    expect(await startDetached(request, deps(hc))).toMatchObject({ status: "refused", refusal: { reason: "move_in_progress" } });
+    expect(await finalState()).toEqual({ ...initial, ...report });
+  });
+
+  it("leaves an earlier finished report as it was when hc fails to start the runner", async () => {
+    const report: Partial<DetachedState> = { phase: "timeout", runner: "t8", outcome: { reason: "wait_timeout", detail: "late" } };
+    await seed(report);
+    const { hc } = starter([], { kind: "spawn_failed" });
+
+    await expect(startDetached(request, deps(hc))).rejects.toMatchObject({ kind: "spawn_failed" });
+    expect(await finalState()).toEqual({ ...initial, ...report });
+  });
+
+  it("starts exactly one runner for two concurrent starts, which reads the machine of the start that won the name", async () => {
+    const { hc, calls } = starter([]);
+    const gated: StarterHc = { ...hc, run: async (argv, options) => {
+      await new Promise((resolve) => setImmediate(resolve));
+      return hc.run(argv, options);
+    } };
+    const [a, b] = await Promise.all([
+      startDetached({ ...request, machine: "machine-a" }, deps(gated)),
+      startDetached({ ...request, machine: "machine-b" }, deps(gated)),
+    ]);
+
+    expect([a.status, b.status].sort()).toEqual(["refused", "started"]);
+    expect(calls).toHaveLength(2);
+    const winner = a.status === "started" ? "machine-a" : "machine-b";
+    const argv = calls.find((call) => call.argv.includes(winner))?.argv ?? [];
+    expect(argv.slice(argv.indexOf("--to"), argv.indexOf("--to") + 2)).toEqual(["--to", winner]);
+    expect(await readdir(dir)).toEqual([]);
   });
 
   it("refuses core_unreachable when the machine HC_SESSION names is not listed, without a lock or a runner", async () => {
