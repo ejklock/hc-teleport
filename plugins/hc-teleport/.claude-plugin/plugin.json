@@ -1,6 +1,6 @@
 {
   "name": "hc-teleport",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Move a Claude Code session to another machine: the /hc-teleport command and the hc-teleport skill. Other agents' sessions cannot move yet.",
   "author": { "name": "Evaldo Klock" },
   "license": "MIT",

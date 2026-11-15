@@ -1,6 +1,6 @@
 {
   "name": "hc-teleport",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Move a coding-agent session between machines from an hc terminal",
   "author": "Evaldo Klock",
   "private": true,

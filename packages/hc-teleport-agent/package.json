@@ -1,9 +1,13 @@
 {
   "name": "hc-teleport-agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Move a Claude Code session to another machine: gives OpenCode and Pi the /hc-teleport command and the hc-teleport skill",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/ejklock/hc-teleport.git", "directory": "packages/hc-teleport-agent" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ejklock/hc-teleport.git",
+    "directory": "packages/hc-teleport-agent"
+  },
   "homepage": "https://github.com/ejklock/hc-teleport#plugins",
   "type": "module",
   "main": "./index.ts",
@@ -11,7 +15,27 @@
     ".": "./index.ts",
     "./server": "./index.ts"
   },
-  "keywords": ["pi-package", "opencode", "opencode-plugin", "hc", "teleport", "ai-agent", "skill"],
-  "pi": { "skills": ["skills"], "prompts": ["prompts"] },
-  "files": ["index.ts", "skills", "prompts", "README.md"]
+  "keywords": [
+    "pi-package",
+    "opencode",
+    "opencode-plugin",
+    "hc",
+    "teleport",
+    "ai-agent",
+    "skill"
+  ],
+  "pi": {
+    "skills": [
+      "skills"
+    ],
+    "prompts": [
+      "prompts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "skills",
+    "prompts",
+    "README.md"
+  ]
 }
