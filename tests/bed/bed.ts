@@ -134,6 +134,8 @@ function exec(
         }
       },
     );
+    // A program that exits before reading its input breaks the pipe; its exit code reports that.
+    child.stdin?.on("error", () => {});
     child.stdin?.end(options.input ?? "");
   });
 }
